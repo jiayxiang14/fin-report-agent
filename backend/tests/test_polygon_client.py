@@ -46,7 +46,9 @@ def test_fetch_daily_bars_raises_on_404():
             asyncio.run(fetch_daily_bars(FAKE_TICKER, client=None))
 
 
-def test_fetch_daily_bars_returns_close_high_low_volume_columns():
+def test_fetch_daily_bars_returns_close_high_low_volume_columns(monkeypatch):
+    monkeypatch.setattr("app.services.polygon_client.settings.polygon_api_key", "test-key")
+
     async def fake_throttled_get(client, url, params):
         payload = {
             "results": [

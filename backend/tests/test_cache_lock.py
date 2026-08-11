@@ -26,6 +26,7 @@ def test_concurrent_fetch_daily_bars_for_same_ticker_only_hits_network_once(tmp_
     +写缓存，第二个等锁之后应该直接命中新鲜缓存，不再发第二次请求。
     """
     monkeypatch.setattr("app.services.polygon_client.CACHE_DIR", tmp_path)
+    monkeypatch.setattr("app.services.polygon_client.settings.polygon_api_key", "test-key")
     call_count = 0
 
     async def fake_throttled_get(client, url, params):
