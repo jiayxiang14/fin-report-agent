@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- K线标记，简化成实心/空心矩形（去掉细线引线）——favicon会被缩到16px显示，
+       细线在那个尺寸下会糊成一团，只有矩形块能在这么小的尺寸下保持可辨识 -->
+  <rect x="5.5" y="10" width="5" height="10" fill="#00AA6F" />
+  <rect x="13.5" y="8" width="5" height="6" fill="none" stroke="#00AA6F" stroke-width="2" />
+  <rect x="21.5" y="14" width="5" height="12" fill="#00AA6F" />
+</svg>

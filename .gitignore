@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+backend/.venv/
+backend/.cache/
+.pytest_cache/
+
+# Env secrets
+.env
+backend/.env
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/node_modules/
+
+# OS
+.DS_Store
