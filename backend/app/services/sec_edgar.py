@@ -30,6 +30,12 @@ TICKER_MAP_CACHE_TTL = timedelta(days=1)
 COMPANY_FACTS_CACHE_TTL = timedelta(hours=6)  # 新财报只在季报/年报发布时出现，缓存几小时足够新鲜
 HISTORY_YEARS = 15  # 多年趋势图默认回看年数
 
+# 年度/季度报表的表格类型族：境外私人发行人（Foreign Private Issuer，比如NBIS这类
+# 荷兰/开曼壳公司结构的公司）不用10-K/10-Q，改用20-F（年报，一年一次）/20-F/A（更正版），
+# 且没有对应的季度报表义务——所以QUARTERLY_FORMS里没有20-F系列的等价物，这不是遗漏。
+ANNUAL_FORMS = ("10-K", "20-F", "20-F/A")
+QUARTERLY_FORMS = ("10-Q",)
+
 # 每类指标按优先级尝试的 us-gaap 标签（不同公司披露习惯不同，取第一个命中的）
 METRIC_TAGS: dict[str, list[str]] = {
     "revenue": [
@@ -147,8 +153,9 @@ async def fetch_company_facts(cik: str, client: httpx.AsyncClient) -> dict:
 
 
 def _parse_points(unit_facts: list[dict]) -> list[dict]:
-    """过滤只保留 10-K / 10-Q 的披露值，按期末日期倒序排列。"""
-    points = [f for f in unit_facts if f.get("form") in ("10-K", "10-Q") and f.get("end")]
+    """过滤只保留年度/季度报表（含境外发行人的20-F系列）的披露值，按期末日期倒序排列。"""
+    valid_forms = ANNUAL_FORMS + QUARTERLY_FORMS
+    points = [f for f in unit_facts if f.get("form") in valid_forms and f.get("end")]
     points.sort(key=lambda f: f["end"], reverse=True)
     return points
 
@@ -174,11 +181,11 @@ def _is_full_year(point: dict) -> bool:
     return days is None or 350 <= days <= 380
 
 
-def _find_yoy_point(points: list[dict], anchor_end: str, form: str) -> dict | None:
-    """在同一批 points 里找一个期末日期比 anchor 早约1年（350~380天）、同类型报表的值。"""
+def _find_yoy_point(points: list[dict], anchor_end: str, forms: tuple[str, ...]) -> dict | None:
+    """在同一批 points 里找一个期末日期比 anchor 早约1年（350~380天）、同类型报表族的值。"""
     anchor_date = datetime.fromisoformat(anchor_end)
     for point in points:
-        if point["form"] != form:
+        if point["form"] not in forms:
             continue
         candidate_date = datetime.fromisoformat(point["end"])
         delta_days = (anchor_date - candidate_date).days
@@ -242,12 +249,12 @@ def _add_free_cash_flow(
 
     latest_annual = None
     if annual_points:
-        yoy = _find_yoy_point(annual_points, annual_points[0]["end"], "10-K")
+        yoy = _find_yoy_point(annual_points, annual_points[0]["end"], ANNUAL_FORMS)
         latest_annual = _build_metric_point(annual_points[0], yoy)
 
     latest_quarterly = None
     if quarterly_points:
-        yoy = _find_yoy_point(quarterly_points, quarterly_points[0]["end"], "10-Q")
+        yoy = _find_yoy_point(quarterly_points, quarterly_points[0]["end"], QUARTERLY_FORMS)
         latest_quarterly = _build_metric_point(quarterly_points[0], yoy)
 
     metrics["free_cash_flow"] = FinancialMetric(
@@ -261,15 +268,21 @@ def _add_free_cash_flow(
 
 def _dedupe_by_end(points: list[dict]) -> list[dict]:
     """同一个 end 日期的数值经常在好几份连续年报里重复出现——比如FY2023的营收，
-    会作为对比年份分别出现在FY2023、FY2024、FY2025三份10-K里（美股年报惯例披露
-    近3年的对比利润表）。只看单个"最新点"时这个重复无所谓（挑哪份结果都一样），
-    但取多年历史序列时会把同一年重复算出3个点。这里按 end 分组，每组只保留
-    filed 最早的那一条——即这个财年"自己那次"年报里的原始披露，不是后续年报
-    带出来的对比数据。"""
+    会作为对比年份分别出现在FY2023、FY2024、FY2025三份年报里（美股年报惯例披露
+    近3年的对比利润表）。取多年历史序列时如果不去重，会把同一年重复算出好几个点。
+
+    这里按 end 分组，每组只保留 filed 最晚的那一条——即公司对这个财年数字"最新的
+    权威表述"。不能取最早那条：正常情况下（无业务重大变化）后续年报里的对比数据
+    跟原始披露数值完全一样，取哪条都无所谓；但真实遇到过公司剥离主要业务后把历史
+    可比期间重述为"持续经营口径"的情况（NBIS/Nebius剥离Yandex俄罗斯业务后，把
+    2022/2023年营收从原始披露的数十亿美元重述成了几千万美元的持续经营口径——
+    公司自己披露的正式财报新闻稿也是用重述后的数字），以及20-F/A更正版明确改写
+    原始20-F数值的情况——这两种场景下"最早那条"就是过时或者被公司自己否定掉的
+    数字，取最晚才是公司当前认可的口径。"""
     best_by_end: dict[str, dict] = {}
     for p in points:
         existing = best_by_end.get(p["end"])
-        if existing is None or p["filed"] < existing["filed"]:
+        if existing is None or p["filed"] > existing["filed"]:
             best_by_end[p["end"]] = p
     return sorted(best_by_end.values(), key=lambda p: p["end"], reverse=True)
 
@@ -292,7 +305,12 @@ def _select_best_tag_points(
         if not tag_data:
             continue
         units = tag_data.get("units", {})
-        unit_name = next(iter(units), None)
+        if not units:
+            continue
+        # 少数公司（比如NBIS这类有俄罗斯/独联体业务历史的境外发行人）同一个标签下
+        # 会同时披露本币和USD两种单位，随手取字典第一个键可能选到非USD单位——
+        # 明确优先选USD，没有USD时才退回随便取一个（比如纯外国公司只用本币披露的情况）。
+        unit_name = "USD" if "USD" in units else next(iter(units), None)
         if unit_name is None:
             continue
 
@@ -300,11 +318,13 @@ def _select_best_tag_points(
         if not points:
             continue
 
-        # 同一个 end 日期下，10-Q/10-K 里常常混着单季度、累计9个月、整年等多种口径
+        # 同一个 end 日期下，10-Q/10-K/20-F 里常常混着单季度、累计9个月、整年等多种口径
         # 的重复披露（start 不同），必须按 start~end 的实际跨度分开挑，不能只看 form+end。
-        annual_points = _dedupe_by_end([p for p in points if p["form"] == "10-K" and _is_full_year(p)])
+        annual_points = _dedupe_by_end(
+            [p for p in points if p["form"] in ANNUAL_FORMS and _is_full_year(p)]
+        )
         quarterly_points = _dedupe_by_end(
-            [p for p in points if p["form"] == "10-Q" and _is_single_quarter(p)]
+            [p for p in points if p["form"] in QUARTERLY_FORMS and _is_single_quarter(p)]
         )
         if not annual_points and not quarterly_points:
             continue
@@ -327,7 +347,7 @@ def _build_history_points(annual_points: list[dict], years: int) -> list[MetricP
     """annual_points 已经按 end 倒序排列；取最近 years 个，逐个算自己那一期的同比，
     再倒转成正序（从早到晚）——前端折线图从左到右应该是时间顺序，不是披露倒序。"""
     recent = annual_points[:years]
-    points = [_build_metric_point(p, _find_yoy_point(annual_points, p["end"], "10-K")) for p in recent]
+    points = [_build_metric_point(p, _find_yoy_point(annual_points, p["end"], ANNUAL_FORMS)) for p in recent]
     return list(reversed(points))
 
 
@@ -404,12 +424,12 @@ def extract_key_metrics(facts_json: dict) -> dict[str, FinancialMetric]:
 
         latest_annual = None
         if latest_annual_raw is not None:
-            yoy = _find_yoy_point(best_annual_points, latest_annual_raw["end"], "10-K")
+            yoy = _find_yoy_point(best_annual_points, latest_annual_raw["end"], ANNUAL_FORMS)
             latest_annual = _build_metric_point(latest_annual_raw, yoy)
 
         latest_quarterly = None
         if latest_quarterly_raw is not None:
-            yoy = _find_yoy_point(best_quarterly_points, latest_quarterly_raw["end"], "10-Q")
+            yoy = _find_yoy_point(best_quarterly_points, latest_quarterly_raw["end"], QUARTERLY_FORMS)
             latest_quarterly = _build_metric_point(latest_quarterly_raw, yoy)
 
         metrics[metric_key] = FinancialMetric(

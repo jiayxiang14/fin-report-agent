@@ -182,6 +182,44 @@ def test_dedupe_by_end_collapses_comparative_year_restatements_in_history():
     assert ends == ["2023-09-30", "2024-09-28", "2025-09-27"]  # 去重后一年一个点，不是6个
 
 
+def test_dedupe_by_end_prefers_latest_filed_value_over_stale_restated_figure():
+    """真实踩过的坑（NBIS/Nebius）：剥离主要业务后，公司把历史可比期间重述成了
+    持续经营口径——同一个end日期在不同年份的年报里数值完全不同，不是单纯的重复
+    披露。这时候必须取filed最晚的那条（公司当前认可的口径），取最早会拿到剥离
+    前、公司自己已经不再使用的旧数字。"""
+    facts_json = _facts_json(
+        {
+            "Revenues": [
+                # 原始披露：含已剥离业务的合并口径
+                _point("2022-12-31", "20-F", "2023-04-20", 7_417_100_000, start="2022-01-01", fy=2022, fp="FY"),
+                # 剥离后重述：持续经营口径，同一个end日期数值完全不同
+                _point("2022-12-31", "20-F", "2025-04-30", 13_500_000, start="2022-01-01", fy=2022, fp="FY"),
+            ],
+        }
+    )
+
+    metrics = extract_key_metrics(facts_json)
+
+    assert metrics["revenue"].latest_annual.val == 13_500_000
+
+
+def test_dedupe_by_end_prefers_amendment_over_original_filing():
+    """20-F/A（更正版）明确修改了原始20-F的数值时，更正版按定义应该覆盖原始版本——
+    取filed最晚的那条天然就是更正版（更正版申报时间必然晚于原始版本）。"""
+    facts_json = _facts_json(
+        {
+            "Assets": [
+                _point("2018-12-31", "20-F", "2019-04-19", 241_698_000_000, fy=2018, fp="FY"),
+                _point("2018-12-31", "20-F/A", "2020-04-02", 259_097_000_000, fy=2018, fp="FY"),
+            ],
+        }
+    )
+
+    metrics = extract_key_metrics(facts_json)
+
+    assert metrics["total_assets"].latest_annual.val == 259_097_000_000
+
+
 def test_extract_metrics_history_orders_chronologically_and_computes_yoy():
     facts_json = _facts_json(
         {
@@ -250,3 +288,97 @@ def test_is_full_year_boundaries():
     assert _is_full_year({"start": "2024-09-29", "end": "2025-09-27"}) is True  # ~363天
     assert _is_full_year({"start": "2026-03-29", "end": "2026-06-27"}) is False  # ~90天，单季度
     assert _is_full_year({"end": "2025-09-27"}) is True  # 无 start，存量指标，不过滤
+
+
+# --- 境外私人发行人（20-F/20-F-A，NBIS这类没有10-K/10-Q的公司）支持
+
+
+def test_20f_annual_filings_are_recognized_as_annual_points():
+    """NBIS真实场景：只有20-F（年报，一年一次），没有10-K/10-Q——旧代码的_parse_points
+    硬编码只认10-K/10-Q，会把这些点全部滤掉，导致get_financials对这类公司返回空数据。"""
+    facts_json = _facts_json(
+        {
+            "Revenues": [
+                _point("2024-12-31", "20-F", "2025-04-15", 500_000_000, start="2024-01-01", fy=2024, fp="FY"),
+                _point("2023-12-31", "20-F", "2024-04-15", 300_000_000, start="2023-01-01", fy=2023, fp="FY"),
+            ],
+        }
+    )
+
+    metrics = extract_key_metrics(facts_json)
+
+    assert metrics["revenue"].latest_annual.val == 500_000_000
+    assert metrics["revenue"].latest_annual.yoy_change_pct == pytest.approx(66.67, abs=0.01)
+
+
+def test_20f_a_amendment_is_also_recognized_as_annual():
+    facts_json = _facts_json(
+        {
+            "Assets": [
+                _point("2024-12-31", "20-F/A", "2025-05-01", 900_000_000, fy=2024, fp="FY"),
+            ],
+        }
+    )
+
+    metrics = extract_key_metrics(facts_json)
+
+    assert metrics["total_assets"].latest_annual.val == 900_000_000
+
+
+def test_prefers_usd_unit_over_other_currency_when_both_are_disclosed():
+    """踩坑：某些有俄罗斯/独联体业务历史的境外发行人（如NBIS）会给同一个标签同时
+    披露本币（如RUB）和USD两种单位——旧代码 next(iter(units)) 随手取字典第一个键，
+    取到哪个纯粹看JSON里units对象的键顺序，可能拿到本币把营收算错几十倍。"""
+    facts_json = {
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "RUB": [
+                            _point(
+                                "2024-12-31", "20-F", "2025-04-15", 45_000_000_000,
+                                start="2024-01-01", fy=2024, fp="FY",
+                            ),
+                        ],
+                        "USD": [
+                            _point(
+                                "2024-12-31", "20-F", "2025-04-15", 500_000_000,
+                                start="2024-01-01", fy=2024, fp="FY",
+                            ),
+                        ],
+                    }
+                }
+            }
+        }
+    }
+
+    metrics = extract_key_metrics(facts_json)
+
+    assert metrics["revenue"].unit == "USD"
+    assert metrics["revenue"].latest_annual.val == 500_000_000
+
+
+def test_falls_back_to_non_usd_unit_when_usd_not_disclosed():
+    """纯本国披露、完全没有USD单位的公司，退回随便取一个单位——不能因为找不到USD
+    就直接跳过这个标签，那样会让数据完全消失，比"单位是本币"更糟。"""
+    facts_json = {
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "EUR": [
+                            _point(
+                                "2024-12-31", "20-F", "2025-04-15", 500_000_000,
+                                start="2024-01-01", fy=2024, fp="FY",
+                            ),
+                        ],
+                    }
+                }
+            }
+        }
+    }
+
+    metrics = extract_key_metrics(facts_json)
+
+    assert metrics["revenue"].unit == "EUR"
+    assert metrics["revenue"].latest_annual.val == 500_000_000

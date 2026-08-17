@@ -17,13 +17,14 @@ Condition，即业绩快报）的8-K申报日期，并且用申报的精确时�
 和被拒绝过的"上下游产业链利好利空判断"是同一类问题——没有数据支撑、又容易被读成买卖信号。
 """
 
-from datetime import datetime
+from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
 import httpx
 import pandas as pd
 
 from app.models.price_reaction import PriceReactionResponse
+from app.services.alpha_vantage_client import AlphaVantageClientError, fetch_json
 from app.services.filing_text import fetch_submissions
 from app.services.polygon_client import PolygonClientError, fetch_daily_bars
 from app.services.sec_client import SecClientError
@@ -33,6 +34,7 @@ VOLUME_BASELINE_WINDOW = 20  # 成交量基线：反应窗口之前20个交易�
 FOLLOW_THROUGH_WINDOW = 5  # 回看窗口：反应之后5个交易日内看这段涨跌有没有被回吐
 _MARKET_CLOSE_HOUR_LOCAL = 16  # 美东时间下午4点收盘
 _NY_TZ = ZoneInfo("America/New_York")
+_ASSUMED_PRE_CLOSE_HOUR_LOCAL = 9  # 方案B（日期精度回退）假设的发布时间：早于收盘
 
 
 class PriceReactionError(Exception):
@@ -71,6 +73,46 @@ async def find_latest_earnings_8k(cik: str, client: httpx.AsyncClient) -> dict |
                 ),
             }
     return best
+
+
+async def _find_fallback_earnings_date(
+    ticker: str, client: httpx.AsyncClient
+) -> tuple[str | None, str | None]:
+    """方案A（SEC 8-K的Item 2.02业绩快报）查不到时的方案B：常见于境外发行人——
+    走6-K/20-F申报，6-K没有items分类字段，没法自动识别哪一条是业绩公告。退化到
+    Alpha Vantage季度盈利数据里的reportedDate当锚点，只有日期没有精确时间戳，
+    调用方需要在note里如实标注精度下降。
+
+    返回 (报告日期, 失败原因)，两者不会同时非None。失败原因只在真正的
+    AlphaVantageClientError（比如没配置ALPHA_VANTAGE_API_KEY、或者当天25次
+    配额用完）时才有值——不能把"配置/配额问题"和"这只票在Alpha Vantage确实
+    没有盈利数据"都笼统地报成"没有数据"，前者换个时间/补上Key就能查到，
+    后者是真的查不到，调用方需要能区分这两种情况分别如实告知用户。
+    交给调用方决定怎么处理，不在这里抛出让整个请求失败。
+    """
+    try:
+        payload = await fetch_json("EARNINGS", ticker, client)
+    except AlphaVantageClientError as exc:
+        return None, str(exc)
+    quarterly = payload.get("quarterlyEarnings") or []
+    if not quarterly:
+        return None, None
+    latest = max(quarterly, key=lambda q: q.get("fiscalDateEnding", ""))
+    return latest.get("reportedDate"), None
+
+
+def _synthesize_acceptance_datetime(filing_date: str) -> str:
+    """把方案B只有日期没有时间戳的锚点，合成一个"当天收盘前"的时间戳喂给
+    _resolve_reaction_window，复用同一套收盘前/收盘后分支逻辑——多数公司选择盘前
+    或盘中发布财报（这个回退路径本来就是为了覆盖NBIS这类实际盘前发布财报的
+    境外发行人），所以统一假设"发布早于当天收盘"：反应窗口是"发布前一交易日收盘
+    -> 发布当天收盘"。如果实际是收盘后发布，这个窗口测的是发布当天而不是真正的
+    次日反应，这就是为什么这条路径比SEC 8-K口径精度低，需要调用方如实标注。
+    """
+    local_at = datetime.combine(date.fromisoformat(filing_date), datetime.min.time()).replace(
+        hour=_ASSUMED_PRE_CLOSE_HOUR_LOCAL, tzinfo=_NY_TZ
+    )
+    return local_at.astimezone(UTC).isoformat()
 
 
 async def _fetch_bars(ticker: str, client: httpx.AsyncClient) -> pd.DataFrame:
@@ -166,6 +208,7 @@ def _compute_follow_through(
 
 async def get_price_reaction(ticker: str) -> PriceReactionResponse:
     ticker = ticker.upper()
+    precision_note: str | None = None
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
@@ -175,25 +218,45 @@ async def get_price_reaction(ticker: str) -> PriceReactionResponse:
 
         earnings_8k = await find_latest_earnings_8k(cik, client)
 
-        if earnings_8k is None or earnings_8k["acceptance_datetime"] is None:
-            return PriceReactionResponse(
-                ticker=ticker,
-                has_data=False,
-                note=(
-                    f"'{ticker}' 最近的申报记录里找不到包含业绩快报（Item 2.02）的8-K，"
-                    "无法计算财报发布前后的价格反应"
-                ),
+        if earnings_8k is not None and earnings_8k["acceptance_datetime"] is not None:
+            acceptance_datetime = earnings_8k["acceptance_datetime"]
+            filing_date = earnings_8k["filing_date"]
+        else:
+            # 方案A查不到（典型场景：境外发行人走6-K/20-F，没有items分类字段可以
+            # 识别业绩公告）——退化到方案B，用Alpha Vantage的报告日期当锚点
+            fallback_date, fallback_error = await _find_fallback_earnings_date(ticker, client)
+            if fallback_date is None:
+                # fallback_error 有值说明是配置/配额问题（能恢复），不是"这只票真的
+                # 没有数据"——两种情况如实分开说，不能笼统地都说成"没有数据"
+                reason = (
+                    f"尝试用Alpha Vantage的报告日期兜底时失败：{fallback_error}"
+                    if fallback_error is not None
+                    else "Alpha Vantage 也没有可用的盈利报告日期"
+                )
+                return PriceReactionResponse(
+                    ticker=ticker,
+                    has_data=False,
+                    note=(
+                        f"'{ticker}' 最近的申报记录里找不到包含业绩快报（Item 2.02）的8-K，"
+                        f"{reason}，无法计算财报发布前后的价格反应"
+                    ),
+                )
+            filing_date = fallback_date
+            acceptance_datetime = _synthesize_acceptance_datetime(fallback_date)
+            precision_note = (
+                "锚点日期来自Alpha Vantage盈利数据的报告日期，非SEC申报的精确时间戳，"
+                "按'发布早于当天收盘'假设计算反应窗口，精度低于SEC 8-K口径"
             )
 
         bars = await _fetch_bars(ticker, client)
 
-    window = _resolve_reaction_window(earnings_8k["acceptance_datetime"], bars.index)
+    window = _resolve_reaction_window(acceptance_datetime, bars.index)
     if window is None:
         return PriceReactionResponse(
             ticker=ticker,
             has_data=False,
-            earnings_filing_date=earnings_8k["filing_date"],
-            note="行情数据覆盖范围不足以定位这次8-K前后的交易日，无法计算价格反应",
+            earnings_filing_date=filing_date,
+            note="行情数据覆盖范围不足以定位这次财报前后的交易日，无法计算价格反应",
         )
 
     pre_date, post_date = window
@@ -210,13 +273,15 @@ async def get_price_reaction(ticker: str) -> PriceReactionResponse:
         bars, pre_close, post_close, post_date, baseline
     )
     note = f"反应窗口：{pre_date.date().isoformat()} 收盘 -> {post_date.date().isoformat()} 收盘"
+    if precision_note:
+        note += f"；{precision_note}"
     if extreme_close is None:
         note += f"；反应后交易日不足{FOLLOW_THROUGH_WINDOW}天，暂无法计算回吐情况"
 
     return PriceReactionResponse(
         ticker=ticker,
         has_data=True,
-        earnings_filing_date=earnings_8k["filing_date"],
+        earnings_filing_date=filing_date,
         pre_close=pre_close,
         post_close=post_close,
         price_change_pct=price_change_pct,

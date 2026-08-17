@@ -4,7 +4,7 @@ from pydantic import BaseModel
 class PriceReactionResponse(BaseModel):
     ticker: str
     has_data: bool
-    earnings_filing_date: str | None = None  # 触发这次反应窗口的8-K申报日期
+    earnings_filing_date: str | None = None  # 触发这次反应窗口的锚点日期（优先8-K申报日，查不到时回退到Alpha Vantage报告日，见note）
     pre_close: float | None = None
     post_close: float | None = None
     price_change_pct: float | None = None

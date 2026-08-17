@@ -9,12 +9,16 @@ from unittest.mock import AsyncMock, patch
 import pandas as pd
 import pytest
 
+from app.services.alpha_vantage_client import AlphaVantageClientError
 from app.services.price_reaction import (
     FOLLOW_THROUGH_WINDOW,
     _avg_volume_baseline,
     _compute_follow_through,
+    _find_fallback_earnings_date,
     _resolve_reaction_window,
+    _synthesize_acceptance_datetime,
     find_latest_earnings_8k,
+    get_price_reaction,
 )
 
 # 用 bdate_range 生成纯工作日（周一到周五）的交易日序列，不依赖对具体某一天是星期几的
@@ -186,3 +190,131 @@ def test_find_latest_earnings_8k_returns_none_when_no_earnings_8k():
         result = asyncio.run(find_latest_earnings_8k("0001018724", client=None))
 
     assert result is None
+
+
+# --- 方案B：SEC 8-K找不到业绩快报时，退化到Alpha Vantage报告日期当锚点
+# （典型场景：境外发行人只有6-K/20-F，没有items分类字段可用于识别业绩公告）
+
+
+def test_synthesize_acceptance_datetime_assumes_pre_close_and_reacts_same_day():
+    # 只有日期没有时间戳的锚点，应该被当成"收盘前发布"喂进_resolve_reaction_window，
+    # 反应窗口落在申报当天收盘（不是被推到下一交易日）
+    monday = _find_weekday(TRADING_DATES, "2026-07-27", target_weekday=0)
+    synthesized = _synthesize_acceptance_datetime(monday.date().isoformat())
+
+    result = _resolve_reaction_window(synthesized, TRADING_DATES)
+
+    assert result is not None
+    _pre_date, post_date = result
+    assert post_date == monday
+
+
+def test_find_fallback_earnings_date_picks_latest_by_fiscal_date():
+    payload = {
+        "quarterlyEarnings": [
+            {"fiscalDateEnding": "2026-03-31", "reportedDate": "2026-04-20"},
+            {"fiscalDateEnding": "2026-06-30", "reportedDate": "2026-07-27"},
+        ]
+    }
+
+    with patch(
+        "app.services.price_reaction.fetch_json",
+        new=AsyncMock(return_value=payload),
+    ):
+        date, error = asyncio.run(_find_fallback_earnings_date("NBIS", client=None))
+
+    assert date == "2026-07-27"
+    assert error is None
+
+
+def test_find_fallback_earnings_date_returns_none_with_no_error_when_no_data():
+    with patch(
+        "app.services.price_reaction.fetch_json",
+        new=AsyncMock(return_value={"quarterlyEarnings": []}),
+    ):
+        date, error = asyncio.run(_find_fallback_earnings_date("NBIS", client=None))
+
+    assert date is None
+    assert error is None  # 真的没有数据，不是配置/配额问题
+
+
+def test_find_fallback_earnings_date_surfaces_the_real_error_reason():
+    """踩坑：配额用完/没配置Key时不该被吞成一个笼统的"没有数据"，调用方需要
+    知道真实原因，才能如实告诉用户"换个时间再试"还是"这只票确实查不到"。"""
+    with patch(
+        "app.services.price_reaction.fetch_json",
+        new=AsyncMock(side_effect=AlphaVantageClientError("已达到 Alpha Vantage 每日25次请求配额，请在 12:00 后重试")),
+    ):
+        date, error = asyncio.run(_find_fallback_earnings_date("NBIS", client=None))
+
+    assert date is None
+    assert error == "已达到 Alpha Vantage 每日25次请求配额，请在 12:00 后重试"
+
+
+def _fake_bars() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "close": [100.0 + i for i in range(len(TRADING_DATES))],
+            "volume": [1000.0] * len(TRADING_DATES),
+        },
+        index=TRADING_DATES,
+    )
+
+
+def test_get_price_reaction_falls_back_to_alpha_vantage_date_when_no_earnings_8k():
+    monday = _find_weekday(TRADING_DATES, "2026-07-27", target_weekday=0)
+    reported_date = monday.date().isoformat()
+
+    with (
+        patch(
+            "app.services.price_reaction.resolve_cik",
+            new=AsyncMock(return_value=("0001513845", "Nebius Group N.V.")),
+        ),
+        patch(
+            "app.services.price_reaction.find_latest_earnings_8k",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "app.services.price_reaction.fetch_json",
+            new=AsyncMock(
+                return_value={
+                    "quarterlyEarnings": [
+                        {"fiscalDateEnding": "2026-06-30", "reportedDate": reported_date}
+                    ]
+                }
+            ),
+        ),
+        patch(
+            "app.services.price_reaction.fetch_daily_bars",
+            new=AsyncMock(return_value=_fake_bars()),
+        ),
+    ):
+        result = asyncio.run(get_price_reaction("NBIS"))
+
+    assert result.has_data is True
+    assert result.earnings_filing_date == reported_date
+    assert "Alpha Vantage" in result.note
+    assert "精度" in result.note
+
+
+def test_get_price_reaction_has_no_data_when_both_sec_and_alpha_vantage_fail():
+    with (
+        patch(
+            "app.services.price_reaction.resolve_cik",
+            new=AsyncMock(return_value=("0001513845", "Nebius Group N.V.")),
+        ),
+        patch(
+            "app.services.price_reaction.find_latest_earnings_8k",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "app.services.price_reaction.fetch_json",
+            new=AsyncMock(side_effect=AlphaVantageClientError("缺少 API Key")),
+        ),
+    ):
+        result = asyncio.run(get_price_reaction("NBIS"))
+
+    assert result.has_data is False
+    assert "8-K" in result.note
+    assert "Alpha Vantage" in result.note
+    assert "缺少 API Key" in result.note  # 真实失败原因要透传出来，不能被吞成笼统的"没有数据"
