@@ -54,7 +54,7 @@ project deliberately separates the two:
 | `get_sector_position` | Where the company's SPDR sector sits on a relative-rotation (RRG) graph vs. the broad market |
 | `get_thematic_flow` | Same RRG methodology applied to 10 narrower supply-chain themes (semiconductors, storage, optical modules, cloud, power, …), with a deterministic ticker→theme match (basket membership + SIC industry classification) |
 | `get_peer_comparison` | Key metrics side-by-side against same-sector peers |
-| `get_filing_text` | Raw 10-K/10-Q text from SEC full-text search — handed to the model unprocessed; no NLP cleaning pipeline, the model reads and filters it itself |
+| `get_filing_text` | Raw 10-K/10-Q text from SEC full-text search — handed to the model unprocessed; no NLP cleaning pipeline, the model reads and filters it itself. Transparently falls back to 20-F/20-F-A for Foreign Private Issuers (companies that don't file 10-K/10-Q at all), with the response's `form` field reflecting what was actually retrieved |
 | `get_price_reaction` | Price/volume move after the last earnings release, plus how much of that initial move was given back in the following days (computed, not an intent judgment like "shakeout" or "bull trap") |
 | `get_earnings_surprise` | Reported EPS vs. analyst consensus EPS (Alpha Vantage), with a code-computed beat/miss/inline verdict |
 | `verify_number` | Re-derives one claimed figure from source data — the self-check step the agent is required to invoke before finalizing |
@@ -81,10 +81,6 @@ frontend/
     components/        Panels (financials, sector, thematic flow, report, ...)
     hooks/              SSE-consuming state machines for the two analysis modes
     lib/                Pure helpers (report XML parsing)
-docs/
-  tricker_agent-mvp.md              Full design doc (system architecture, roadmap)
-  开发日志.md                        Dev log — what was built, what broke, why
-  现存问题与技术竞争力.md              Honest self-assessment of gaps and strengths
 ```
 
 ## Getting started
@@ -151,11 +147,10 @@ All four run in CI on every push/PR to `main` (`.github/workflows/ci.yml`).
 This is a single-agent MVP, deliberately scoped:
 
 - No earnings-call transcripts (would require a paid data source; only
-  SEC EDGAR 10-K/10-Q text is used)
+  SEC EDGAR filing text is used — 10-K/10-Q for domestic filers, 20-F/20-F-A
+  for Foreign Private Issuers)
 - No multi-agent orchestration
 - No real reinforcement-learning training — Best-of-N is reward-driven
   *selection* among sampled candidates with hand-tuned weights, not
   weight training
 - No cross-session memory, batch scanning, or trading advice
-
-See `docs/tricker_agent-mvp.md` for the full design rationale.
