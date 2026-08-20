@@ -10,9 +10,12 @@
 规则约束），下面单独测。
 """
 
+from unittest.mock import AsyncMock, patch
+
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.models.financials import FinancialsResponse
 
 client = TestClient(app)
 
@@ -42,6 +45,13 @@ def test_ticker_too_long_is_rejected_with_422():
 
 
 def test_class_share_ticker_with_dot_is_accepted():
-    response = client.get("/api/financials/BRK.B")
+    # 只测路径校验层放行了带点号的ticker——不依赖真实SEC EDGAR请求/环境变量
+    # （SEC_EDGAR_USER_AGENT在CI里没配置，之前直接打真实请求会在校验层之后
+    # 崩掉，跟这条测试本身要验证的东西无关）
+    fake = FinancialsResponse(
+        ticker="BRK.B", cik="0001067983", entity_name="Berkshire Hathaway Inc.", metrics={}, retrieved_at="2026-08-07T00:00:00Z"
+    )
+    with patch("app.api.routes.financials.get_financials", new=AsyncMock(return_value=fake)):
+        response = client.get("/api/financials/BRK.B")
 
     assert response.status_code != 422
