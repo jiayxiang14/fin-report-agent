@@ -163,15 +163,19 @@ class AnthropicCompatibleClient:
         return [*messages, {"role": "user", "content": content}]
 
 
-def get_llm_client() -> AnthropicCompatibleClient:
-    if settings.llm_provider == "claude":
+def get_llm_client(provider: str | None = None) -> AnthropicCompatibleClient:
+    """`provider`留空时用`settings.llm_provider`（现有行为不变）。传具体值时
+    覆盖——目前唯一的调用场景是`reward.py`的LLM裁判可选择走跟生成报告不同的
+    供应商，减少"用同一个模型评自己生成的内容"这种自评偏好嫌疑。"""
+    resolved_provider = provider or settings.llm_provider
+    if resolved_provider == "claude":
         return AnthropicCompatibleClient(
             base_url=CLAUDE_BASE_URL,
             api_key=settings.anthropic_api_key,
             model=settings.llm_model or CLAUDE_DEFAULT_MODEL,
             use_cache_control=True,
         )
-    if settings.llm_provider == "deepseek":
+    if resolved_provider == "deepseek":
         return AnthropicCompatibleClient(
             base_url=DEEPSEEK_BASE_URL,
             api_key=settings.deepseek_api_key,
@@ -179,4 +183,4 @@ def get_llm_client() -> AnthropicCompatibleClient:
             # DeepSeek 是自动前缀缓存，不需要/未验证是否接受 cache_control 字段，先不发送
             use_cache_control=False,
         )
-    raise ValueError(f"不支持的 LLM_PROVIDER: {settings.llm_provider!r}，只能是 'deepseek' 或 'claude'")
+    raise ValueError(f"不支持的 LLM_PROVIDER: {resolved_provider!r}，只能是 'deepseek' 或 'claude'")

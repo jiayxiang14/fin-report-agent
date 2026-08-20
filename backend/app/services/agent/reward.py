@@ -16,11 +16,13 @@ transcript.tool_output_summary——那个已经被截断到300字符，做数�
 
 from __future__ import annotations
 
-import json
+import asyncio
 import re
 
+from app.core.config import settings
 from app.models.agent import AgentRunResult, ReasoningNote, TranscriptEntry
 from app.models.best_of_n import RuleScoreBreakdown
+from app.services.agent import traceability
 from app.services.agent.llm_client import get_llm_client
 
 TRACEABILITY_MAX = 50.0
@@ -31,10 +33,6 @@ LENGTH_MAX = 10.0
 MIN_REPORT_LENGTH = 300
 MAX_REPORT_LENGTH = 3000
 
-# 简报文字大概率是四舍五入过的，容差比 verify_number.py 的1%(核对同一个数字来源)
-# 稍宽一点
-TRACEABILITY_TOLERANCE_PCT = 2.0
-
 # 规则分依然是权重最高的单一分量（"硬性底线"，项目书原话），加入过程裁判后
 # 总裁判权重从0.4涨到0.5，在结论裁判和过程裁判之间对半分——不是两者一样重要
 # 所以对半分，是目前没有证据支撑"哪个更该多信"，对半分是没有偏见的起点
@@ -42,17 +40,27 @@ RULE_WEIGHT = 0.5
 OUTCOME_JUDGE_WEIGHT = 0.25
 TRAJECTORY_JUDGE_WEIGHT = 0.25
 
+# 每个裁判独立采样几次取平均（轻量自我一致性），缓解单次采样抽到极端分数的方差。
+# 必须配非零温度——0.0温度下重复采样会得到几乎相同的单点结果，自我一致性就没有
+# 意义了。3次是"能看出方差"和"不把裁判这一步的调用量炸到不成比例"之间的折中，
+# 裁判prompt本身很短（不带工具、不带财报全文），3倍调用量相对Agent Loop主体的
+# 开销依然是零头
+JUDGE_SAMPLE_COUNT = 3
+JUDGE_SAMPLE_TEMPERATURE = 0.7
+
 _TAG_PATTERNS = {
     tag: re.compile(rf"<{tag}>([\s\S]*?)</{tag}>") for tag in ("conclusion", "evidence", "flags")
 }
-_NUMBER_TOKEN_PATTERN = re.compile(r"-?\d[\d,]*\.?\d*")
 
+# 理由标签放在分数标签之前：裁判模型是自回归生成的，如果先输出<score>，理由只是
+# 打完分之后补的场面话，并没有真正参与打分；要求先写理由再给分，让分数以自己刚
+# 写出的推理为条件生成（G-Eval的核心思路），比"先斩后奏"式的评分更可信
 _JUDGE_PROMPT_TEMPLATE = """你是一个投研简报质量评审员。请阅读下面这份AI生成的投研简报，
 按"逻辑连贯性、有没有自相矛盾、洞察是否有价值"这几个维度打一个1到10的整数分。
 
-只按下面的格式回复，不要有其他任何文字：
-<score>分数</score>
+先写出你的推理过程，再给出分数。只按下面的格式回复，不要有其他任何文字：
 <reason>一句话说明理由</reason>
+<score>分数</score>
 
 简报内容：
 {report}
@@ -66,9 +74,9 @@ _TRAJECTORY_JUDGE_PROMPT_TEMPLATE = """你是一个投研Agent的决策过程评
 数字、工具调用是否高效（有没有明显绕弯路或重复劳动）"这几个维度打一个1到10的
 整数分。
 
-只按下面的格式回复，不要有其他任何文字：
-<score>分数</score>
+先写出你的推理过程，再给出分数。只按下面的格式回复，不要有其他任何文字：
 <reason>一句话说明理由</reason>
+<score>分数</score>
 
 决策轨迹：
 {trajectory}
@@ -83,84 +91,14 @@ def _extract_tag(text: str, tag: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
-def _looks_like_year(raw_token: str, value: float) -> bool:
-    return raw_token.isdigit() and len(raw_token) == 4 and 1900 <= value <= 2100
-
-
-def _looks_like_trivial_integer(raw_token: str) -> bool:
-    # 一位数的纯整数常见于列表序号/轮次编号，不是真正需要溯源的数据主张
-    return raw_token.isdigit() and len(raw_token) == 1
-
-
-def _extract_claimed_numbers(text: str) -> list[float]:
-    numbers = []
-    for raw_token in _NUMBER_TOKEN_PATTERN.findall(text):
-        cleaned = raw_token.replace(",", "")
-        if cleaned in ("", "-", "."):
-            continue
-        try:
-            value = float(cleaned)
-        except ValueError:
-            continue
-        if _looks_like_year(cleaned, value) or _looks_like_trivial_integer(cleaned):
-            continue
-        numbers.append(value)
-    return numbers
-
-
-def _walk_json_numbers(node: object, acc: set[float]) -> None:
-    """递归收集"已知数字"。除了JSON里本来就是数值类型的叶子值，字符串叶子值
-    也要用同一套正则去抽取——`get_filing_text`返回的财报原文是整段塞在`text`
-    字段里的字符串，简报引用的数字如果来源是财报原文叙述而不是`get_financials`
-    这类结构化字段，之前完全不会被收进"已知数字"集合，这是真实跑过AMZN后
-    发现的可追溯性打分漏判的主要来源（比预想的"单位换算问题"更严重）。
-    """
-    if isinstance(node, bool):
-        return
-    if isinstance(node, int | float):
-        acc.add(float(node))
-    elif isinstance(node, str):
-        acc.update(_extract_claimed_numbers(node))
-    elif isinstance(node, dict):
-        for value in node.values():
-            _walk_json_numbers(value, acc)
-    elif isinstance(node, list):
-        for item in node:
-            _walk_json_numbers(item, acc)
-
-
-def _collect_known_numbers(raw_tool_outputs: list[str]) -> set[float]:
-    known: set[float] = set()
-    for raw in raw_tool_outputs:
-        try:
-            payload = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        _walk_json_numbers(payload, known)
-    return known
-
-
-def _has_close_match(value: float, known: set[float]) -> bool:
-    for candidate in known:
-        if candidate == 0:
-            if value == 0:
-                return True
-            continue
-        if abs(value - candidate) / abs(candidate) * 100 <= TRACEABILITY_TOLERANCE_PCT:
-            return True
-    return False
-
-
 def _score_traceability(report_text: str, raw_tool_outputs: list[str]) -> tuple[float, int, int]:
-    evidence = _extract_tag(report_text, "evidence") or ""
-    flags = _extract_tag(report_text, "flags") or ""
-    claimed = _extract_claimed_numbers(f"{evidence}\n{flags}")
-    if not claimed:
+    """抽取/比对逻辑本身在 `traceability.py`（`loop.py`的事后校验信号复用的
+    同一套实现），这里只是把 (matched, total) 换算成本文件的0-50分制。"""
+    matched, total = traceability.score_traceability(report_text, raw_tool_outputs)
+    if total == 0:
         # 没有可核对的数字主张，不等于"数字有问题"，给满分
         return TRACEABILITY_MAX, 0, 0
-    known = _collect_known_numbers(raw_tool_outputs)
-    matched = sum(1 for value in claimed if _has_close_match(value, known))
-    return matched / len(claimed) * TRACEABILITY_MAX, matched, len(claimed)
+    return matched / total * TRACEABILITY_MAX, matched, total
 
 
 def _score_self_verification(transcript: list[TranscriptEntry]) -> float:
@@ -199,21 +137,27 @@ def _render_trajectory(reasoning_notes: list[ReasoningNote], transcript: list[Tr
     return "\n".join(text for _, text in steps)
 
 
-async def _call_judge(prompt: str) -> tuple[float | None, str | None]:
+async def _call_judge(prompt: str, temperature: float = 0.0) -> tuple[float | None, str | None]:
     """裁判调用的共享实现：结论裁判（score_llm_judge）和过程裁判
     （score_trajectory_judge）用的是同一套"发起不带工具的LLM调用+解析
     <score>/<reason>标签"逻辑，只是喂进去的prompt内容不同，抽成一个函数
     避免两份几乎一样的try/except+正则解析代码。调用失败或没按格式回复时
     统一返回(None, None)，调用方据此软降级，不编造一个"中性分"去混合，
     那样会稀释真实信号。
+
+    默认走跟生成报告同一个供应商（`settings.judge_llm_provider`留空）；配置了
+    这个环境变量时，裁判改走指定的供应商——避免"用同一个模型评自己生成的
+    内容"这种自评偏好嫌疑。对应供应商的 API Key 没配置时，`get_llm_client`
+    会在真正发起请求时因为空 api_key 报错，走上面 except 分支软降级，不会
+    让整个候选打分崩掉。
     """
-    llm = get_llm_client()
+    llm = get_llm_client(settings.judge_llm_provider or None)
     try:
         response = await llm.create_message(
             system="你是一个严格但公正的评审员。",
             messages=[{"role": "user", "content": prompt}],
             tools=[],
-            temperature=0.0,
+            temperature=temperature,
         )
     except Exception:  # noqa: BLE001 - 裁判调用是软性加分项，失败要降级不能拖垮整个候选打分
         return None, None
@@ -227,6 +171,22 @@ async def _call_judge(prompt: str) -> tuple[float | None, str | None]:
     reason_match = _REASON_TAG_PATTERN.search(text)
     reason = reason_match.group(1).strip() if reason_match else None
     return raw_score / 10 * 100, reason
+
+
+async def _call_judge_ensemble(prompt: str, samples: int = JUDGE_SAMPLE_COUNT) -> tuple[float | None, str | None]:
+    """轻量自我一致性：同一个裁判prompt并发独立采样`samples`次（非零温度，
+    否则重复采样会得到几乎相同的单点结果，失去自我一致性的意义），取分数
+    平均值，降低单次采样抽到极端分数的方差。理由文本保留第一个成功样本的——
+    多份理由没有天然的合并方式，展示一条有代表性的说明就够了，不需要为了
+    "完整"把几条理由拼在一起。全部采样都失败（调用报错/格式解析失败）时
+    统一返回(None, None)，跟单次调用失败时的降级方式一致。
+    """
+    results = await asyncio.gather(*(_call_judge(prompt, temperature=JUDGE_SAMPLE_TEMPERATURE) for _ in range(samples)))
+    scores = [score for score, _ in results if score is not None]
+    if not scores:
+        return None, None
+    reason = next((reason for _, reason in results if reason is not None), None)
+    return round(sum(scores) / len(scores), 2), reason
 
 
 def score_rule_based(run_result: AgentRunResult, raw_tool_outputs: list[str]) -> RuleScoreBreakdown:
@@ -253,7 +213,7 @@ async def score_llm_judge(final_report: str | None) -> tuple[float | None, str |
     """
     if not final_report:
         return None, None
-    return await _call_judge(_JUDGE_PROMPT_TEMPLATE.format(report=final_report))
+    return await _call_judge_ensemble(_JUDGE_PROMPT_TEMPLATE.format(report=final_report))
 
 
 async def score_trajectory_judge(
@@ -267,7 +227,7 @@ async def score_trajectory_judge(
     trajectory = _render_trajectory(reasoning_notes, transcript)
     if not trajectory:
         return None, None
-    return await _call_judge(_TRAJECTORY_JUDGE_PROMPT_TEMPLATE.format(trajectory=trajectory))
+    return await _call_judge_ensemble(_TRAJECTORY_JUDGE_PROMPT_TEMPLATE.format(trajectory=trajectory))
 
 
 def combine_scores(

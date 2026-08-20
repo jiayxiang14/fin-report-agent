@@ -40,9 +40,21 @@ def test_intermediate_turn_text_is_captured_as_reasoning_note():
             raw=None,
         ),
         # 第一次 end_turn 时还没调用过 verify_number，会被自我核查兜底拦一次
-        # （见 test_self_verification_nudge.py），所以还需要一轮收尾的 end_turn
-        LLMResponse(stop_reason="end_turn", text="<conclusion>...</conclusion>", tool_calls=[], raw=None),
-        LLMResponse(stop_reason="end_turn", text="<conclusion>...</conclusion>", tool_calls=[], raw=None),
+        # （见 test_self_verification_nudge.py），所以还需要一轮收尾的 end_turn。
+        # evidence/flags标签必须都在，不然会先被结构合规gate拦下来
+        # （见test_structure_gate_nudge.py），需要更多轮次，这里不测那个
+        LLMResponse(
+            stop_reason="end_turn",
+            text="<conclusion>...</conclusion><evidence>...</evidence><flags>...</flags>",
+            tool_calls=[],
+            raw=None,
+        ),
+        LLMResponse(
+            stop_reason="end_turn",
+            text="<conclusion>...</conclusion><evidence>...</evidence><flags>...</flags>",
+            tool_calls=[],
+            raw=None,
+        ),
     ]
     fake = FakeLLMClient(responses)
     with (
@@ -95,9 +107,20 @@ def test_on_event_fires_in_expected_order_for_reasoning_and_tool_calls():
             raw=None,
         ),
         # 第一次 end_turn 时还没调用过 verify_number，会被自我核查兜底拦一次
-        # （见 test_self_verification_nudge.py），所以还需要一轮收尾的 end_turn
-        LLMResponse(stop_reason="end_turn", text="<conclusion>...</conclusion>", tool_calls=[], raw=None),
-        LLMResponse(stop_reason="end_turn", text="<conclusion>...</conclusion>", tool_calls=[], raw=None),
+        # （见 test_self_verification_nudge.py），所以还需要一轮收尾的 end_turn。
+        # evidence/flags标签必须都在，不然会先被结构合规gate拦下来
+        LLMResponse(
+            stop_reason="end_turn",
+            text="<conclusion>...</conclusion><evidence>...</evidence><flags>...</flags>",
+            tool_calls=[],
+            raw=None,
+        ),
+        LLMResponse(
+            stop_reason="end_turn",
+            text="<conclusion>...</conclusion><evidence>...</evidence><flags>...</flags>",
+            tool_calls=[],
+            raw=None,
+        ),
     ]
     fake = FakeLLMClient(responses)
     events: list[dict] = []
@@ -119,7 +142,7 @@ def test_on_event_fires_in_expected_order_for_reasoning_and_tool_calls():
     assert events[1]["tool_name"] == "get_financials"
     assert events[2]["tool_name"] == "get_financials"
     assert events[2]["is_error"] is False
-    assert events[3]["text"] == "<conclusion>...</conclusion>"
+    assert events[3]["text"] == "<conclusion>...</conclusion><evidence>...</evidence><flags>...</flags>"
 
 
 def test_final_report_falls_back_to_earlier_tagged_draft_when_last_turn_has_no_tags():
@@ -293,3 +316,48 @@ def test_max_turns_exceeded_marks_not_completed():
     assert result.completed is False
     assert result.stop_reason == "max_turns_exceeded"
     assert result.turns_used == 3
+
+
+def test_traceable_numbers_reflect_final_report_against_tool_outputs():
+    """普通单次分析路径（没有传 on_tool_result）现在也应该自己算出数字可
+    追溯性信号——之前这个校验只在 Best-of-N 内部生效，普通分析完全没有。"""
+    _final_response = LLMResponse(
+        stop_reason="end_turn",
+        text="<conclusion>强劲</conclusion><evidence>营收达到950000000美元</evidence><flags></flags>",
+        tool_calls=[],
+        raw=None,
+    )
+    responses = [
+        LLMResponse(
+            stop_reason="tool_use",
+            text=None,
+            tool_calls=[ToolCall(id="1", name="get_financials", input={"ticker": "AAPL"})],
+            raw=None,
+        ),
+        # 第一次 end_turn 时还没调用过 verify_number，会被自我核查兜底拦一次
+        # （见 test_self_verification_nudge.py），所以还需要一轮收尾的 end_turn
+        _final_response,
+        _final_response,
+    ]
+    fake = FakeLLMClient(responses)
+    tool_output = '{"revenue": 950000000}'
+    with (
+        patch("app.services.agent.loop.get_llm_client", return_value=fake),
+        patch("app.services.agent.loop.execute_tool", new=AsyncMock(return_value=(tool_output, False))),
+    ):
+        result = asyncio.run(run_agent_loop("AAPL"))
+
+    assert result.traceable_numbers_matched == 1
+    assert result.traceable_numbers_total == 1
+
+
+def test_traceable_numbers_default_to_zero_when_no_numeric_claims():
+    # 故意不带 <conclusion> 标签——带的话会触发自我核查兜底要求再走一轮，
+    # 这里只关心"没有数字主张时 total 是 0"这一件事，不需要凑第二轮响应
+    responses = [LLMResponse(stop_reason="end_turn", text="最终简报，无数字", tool_calls=[], raw=None)]
+    fake = FakeLLMClient(responses)
+    with patch("app.services.agent.loop.get_llm_client", return_value=fake):
+        result = asyncio.run(run_agent_loop("AAPL"))
+
+    assert result.traceable_numbers_matched == 0
+    assert result.traceable_numbers_total == 0

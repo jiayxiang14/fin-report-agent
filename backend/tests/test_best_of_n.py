@@ -5,13 +5,15 @@
 
 import asyncio
 import json
+import os
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from app.models.agent import AgentRunResult
 from app.models.best_of_n import RuleScoreBreakdown
-from app.services.agent import best_of_n
+from app.services.agent import best_of_n, trace_log
 
 
 def _run_result(ticker: str, report: str) -> AgentRunResult:
@@ -43,6 +45,13 @@ def isolated_run_log(tmp_path, monkeypatch):
     log_path = tmp_path / "best_of_n_runs.jsonl"
     monkeypatch.setattr(best_of_n, "RUNS_LOG_PATH", log_path)
     return log_path
+
+
+@pytest.fixture
+def isolated_candidate_trace_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(best_of_n, "CANDIDATE_TRACE_DIR", tmp_path / "candidate_traces")
+    monkeypatch.setattr(trace_log, "TRACE_DIR", tmp_path / "traces")
+    return tmp_path
 
 
 def test_selects_candidate_with_highest_total_score(isolated_run_log):
@@ -202,7 +211,60 @@ def test_candidate_failed_event_emitted_and_other_candidates_still_run():
     failed_events = [e for e in events if e["type"] == "candidate_failed"]
     assert len(failed_events) == 1
     assert failed_events[0]["candidate_index"] == 1
-    assert failed_events[0]["error"] == "网络错误"
+    # 前缀区分是Agent Loop本身失败还是跑完之后打分阶段失败——这里是loop直接
+    # 抛的异常，run_result从没被赋值过，应该标成"Agent Loop 本身失败"
+    assert failed_events[0]["error"] == "[Agent Loop 本身失败] 网络错误"
+
+    scored_events = [e for e in events if e["type"] == "candidate_scored"]
+    assert [e["candidate_index"] for e in scored_events] == [0, 2]
+
+
+def test_scoring_stage_failure_does_not_lose_other_successful_candidates():
+    """真实故障注入复现过的问题：之前try/except只包住了run_agent_loop这一步，
+    3个候选的Agent Loop全部真实跑完成功（真花了钱），但打分阶段
+    （reward.score_rule_based等）如果对其中一个候选抛了异常，会顺着
+    asyncio.gather把整个run_best_of_n炸掉——另外两个已经成功的候选结果
+    也会一起丢失，违背了这个模块自己承诺的"单个候选失败不拖垮整批"。
+    现在try/except覆盖了整个候选生命周期（loop+打分），这里验证：候选1
+    打分阶段失败，不应该影响候选0/2正常参与选择。"""
+    events: list[dict] = []
+
+    async def on_event(event: dict) -> None:
+        events.append(event)
+
+    run_results = {0: _run_result("AAPL", "候选0"), 1: _run_result("AAPL", "候选1"), 2: _run_result("AAPL", "候选2")}
+
+    async def fake_run_agent_loop(ticker, temperature=None, on_event=None, on_tool_result=None, reflexion_check=None):
+        call = fake_run_agent_loop.calls
+        fake_run_agent_loop.calls += 1
+        return run_results[call]
+
+    fake_run_agent_loop.calls = 0
+
+    def flaky_score_rule_based(run_result, raw_outputs):
+        if run_result.final_report == "候选1":
+            raise ValueError("模拟reward.py里的一个边界情况bug")
+        return _rule_score(50.0)
+
+    with (
+        patch("app.services.agent.best_of_n.run_agent_loop", new=fake_run_agent_loop),
+        patch("app.services.agent.best_of_n.reward.score_rule_based", side_effect=flaky_score_rule_based),
+        patch("app.services.agent.best_of_n.reward.score_llm_judge", new=AsyncMock(return_value=(None, None))),
+        patch("app.services.agent.best_of_n.reward.score_trajectory_judge", new=AsyncMock(return_value=(None, None))),
+        patch("app.services.agent.best_of_n.reward.combine_scores", return_value=50.0),
+    ):
+        result = asyncio.run(best_of_n.run_best_of_n("AAPL", on_event=on_event))
+
+    # 候选0/2都正常参与了选择（不是整批被打分阶段的异常炸掉）
+    assert result.selected.final_report in ("候选0", "候选2")
+
+    failed_events = [e for e in events if e["type"] == "candidate_failed"]
+    assert len(failed_events) == 1
+    assert failed_events[0]["candidate_index"] == 1
+    # run_result在异常抛出前已经被赋值过（loop本身是成功的），应该标成
+    # "打分阶段失败"，不是"Agent Loop 本身失败"——方便排查是loop坏了还是
+    # reward.py坏了
+    assert failed_events[0]["error"] == "[打分阶段失败] 模拟reward.py里的一个边界情况bug"
 
     scored_events = [e for e in events if e["type"] == "candidate_scored"]
     assert [e["candidate_index"] for e in scored_events] == [0, 2]
@@ -326,8 +388,9 @@ class _FakeLLMClientForCandidate:
 
 
 def _verified_end_turn(text: str) -> list:
-    """先核实一个数字满足自我核查底线，再end_turn——避免自我核查兜底截胡了
-    第一次end_turn机会，干扰对reflexion这条链路的观察。"""
+    """先查financials、核实一个数字满足结构合规/工具使用底线/自我核查这几道
+    排在reflexion前面的gate，再end_turn——避免这些gate截胡了第一次end_turn
+    机会，干扰对reflexion这条链路的观察。"""
     from app.services.agent.llm_client import LLMResponse, ToolCall
 
     return [
@@ -335,15 +398,21 @@ def _verified_end_turn(text: str) -> list:
             stop_reason="tool_use",
             text=None,
             tool_calls=[
+                ToolCall(id="0", name="get_financials", input={"ticker": "AAPL"}),
                 ToolCall(
                     id="1",
                     name="verify_number",
                     input={"ticker": "AAPL", "metric": "revenue", "claimed_value": 1.0, "period": "annual"},
-                )
+                ),
             ],
             raw=None,
         ),
-        LLMResponse(stop_reason="end_turn", text=f"<conclusion>{text}</conclusion>", tool_calls=[], raw=None),
+        LLMResponse(
+            stop_reason="end_turn",
+            text=f"<conclusion>{text}</conclusion><evidence>e</evidence><flags>f</flags>",
+            tool_calls=[],
+            raw=None,
+        ),
     ]
 
 
@@ -380,7 +449,12 @@ def test_run_candidate_recomputes_trajectory_score_when_reflexion_triggered():
 
     responses = [
         *_verified_end_turn("结论"),
-        LLMResponse(stop_reason="end_turn", text="<conclusion>结论（已整改）</conclusion>", tool_calls=[], raw=None),
+        LLMResponse(
+            stop_reason="end_turn",
+            text="<conclusion>结论（已整改）</conclusion><evidence>e</evidence><flags>f</flags>",
+            tool_calls=[],
+            raw=None,
+        ),
     ]
     fake_llm = _FakeLLMClientForCandidate(responses)
     scores = [(best_of_n.REFLEXION_SCORE_THRESHOLD - 1, "信息不足"), (90.0, "已改进")]
@@ -441,3 +515,170 @@ def test_reflexion_triggered_propagates_to_candidate_summary_and_scored_event(is
     scored_events = [e for e in events if e["type"] == "candidate_scored"]
     assert scored_events[0]["reflexion_triggered"] is True
     assert scored_events[1]["reflexion_triggered"] is False
+
+
+# --- 候选完整工具输出接入trace_log：只永久保留胜出候选，其余走短期缓存 ---
+
+
+def _fake_run_agent_loop_capturing_tool_output(run_results):
+    """每个候选调用一次on_tool_result，内容按候选序号区分，方便断言"提升"
+    进永久trace的确实是胜出候选自己的那份，不是随便哪个候选的。"""
+
+    async def fake(ticker, temperature=None, on_event=None, on_tool_result=None, reflexion_check=None):
+        call = fake.calls
+        fake.calls += 1
+        if on_tool_result is not None:
+            await on_tool_result("get_financials", f"候选{call}的完整工具输出")
+        return run_results[call]
+
+    fake.calls = 0
+    return fake
+
+
+def test_winning_candidates_full_output_is_promoted_to_the_permanent_trace(
+    isolated_run_log, isolated_candidate_trace_dir
+):
+    run_results = [_run_result("AAPL", f"候选{i}") for i in range(3)]
+    rule_scores = [_rule_score(40.0), _rule_score(90.0), _rule_score(60.0)]  # 候选1胜出
+    trace_id = "a" * 32
+
+    with (
+        patch(
+            "app.services.agent.best_of_n.run_agent_loop",
+            new=_fake_run_agent_loop_capturing_tool_output(run_results),
+        ),
+        patch("app.services.agent.best_of_n.reward.score_rule_based", side_effect=rule_scores),
+        patch("app.services.agent.best_of_n.reward.score_llm_judge", new=AsyncMock(return_value=(None, None))),
+        patch("app.services.agent.best_of_n.reward.score_trajectory_judge", new=AsyncMock(return_value=(None, None))),
+        patch(
+            "app.services.agent.best_of_n.reward.combine_scores",
+            side_effect=lambda rule, outcome_llm, trajectory_llm: rule.total,
+        ),
+    ):
+        result = asyncio.run(best_of_n.run_best_of_n("AAPL", trace_id=trace_id))
+
+    assert result.selected_index == 1
+
+    promoted = trace_log.read_trace(trace_id)
+    full_output_events = [e for e in promoted if e["type"] == "tool_result_full"]
+    assert len(full_output_events) == 1
+    assert full_output_events[0]["candidate_index"] == 1
+    assert full_output_events[0]["output"] == "候选1的完整工具输出"
+
+
+def test_losing_candidates_stay_in_short_term_cache_winner_is_removed_after_promotion(
+    isolated_run_log, isolated_candidate_trace_dir
+):
+    run_results = [_run_result("AAPL", f"候选{i}") for i in range(3)]
+    rule_scores = [_rule_score(40.0), _rule_score(90.0), _rule_score(60.0)]  # 候选1胜出
+    trace_id = "b" * 32
+
+    with (
+        patch(
+            "app.services.agent.best_of_n.run_agent_loop",
+            new=_fake_run_agent_loop_capturing_tool_output(run_results),
+        ),
+        patch("app.services.agent.best_of_n.reward.score_rule_based", side_effect=rule_scores),
+        patch("app.services.agent.best_of_n.reward.score_llm_judge", new=AsyncMock(return_value=(None, None))),
+        patch("app.services.agent.best_of_n.reward.score_trajectory_judge", new=AsyncMock(return_value=(None, None))),
+        patch(
+            "app.services.agent.best_of_n.reward.combine_scores",
+            side_effect=lambda rule, outcome_llm, trajectory_llm: rule.total,
+        ),
+    ):
+        asyncio.run(best_of_n.run_best_of_n("AAPL", trace_id=trace_id))
+
+    # 候选0/2没被选中：短期缓存文件还在，没被提升也没被删
+    assert best_of_n._candidate_trace_file(trace_id, 0).exists()
+    assert best_of_n._candidate_trace_file(trace_id, 2).exists()
+    # 候选1胜出：提升成功后短期文件应该被清掉，不留重复数据
+    assert not best_of_n._candidate_trace_file(trace_id, 1).exists()
+
+
+def test_no_trace_id_skips_candidate_trace_machinery_entirely(isolated_run_log, isolated_candidate_trace_dir):
+    run_results = [_run_result("AAPL", f"候选{i}") for i in range(3)]
+
+    with (
+        patch(
+            "app.services.agent.best_of_n.run_agent_loop",
+            new=_fake_run_agent_loop_capturing_tool_output(run_results),
+        ),
+        patch("app.services.agent.best_of_n.reward.score_rule_based", return_value=_rule_score(50.0)),
+        patch("app.services.agent.best_of_n.reward.score_llm_judge", new=AsyncMock(return_value=(None, None))),
+        patch("app.services.agent.best_of_n.reward.score_trajectory_judge", new=AsyncMock(return_value=(None, None))),
+        patch("app.services.agent.best_of_n.reward.combine_scores", return_value=50.0),
+    ):
+        asyncio.run(best_of_n.run_best_of_n("AAPL"))  # 不传trace_id，向后兼容
+
+    assert not best_of_n.CANDIDATE_TRACE_DIR.exists()  # 整个机制完全没被触发
+
+
+def test_run_best_of_n_evicts_expired_candidate_traces_on_every_call(
+    isolated_run_log, isolated_candidate_trace_dir, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(best_of_n, "_evict_expired_candidate_traces", lambda: calls.append(True))
+    run_results = [_run_result("AAPL", f"候选{i}") for i in range(3)]
+
+    with (
+        patch("app.services.agent.best_of_n.run_agent_loop", new=AsyncMock(side_effect=run_results)),
+        patch("app.services.agent.best_of_n.reward.score_rule_based", return_value=_rule_score(50.0)),
+        patch("app.services.agent.best_of_n.reward.score_llm_judge", new=AsyncMock(return_value=(None, None))),
+        patch("app.services.agent.best_of_n.reward.score_trajectory_judge", new=AsyncMock(return_value=(None, None))),
+        patch("app.services.agent.best_of_n.reward.combine_scores", return_value=50.0),
+    ):
+        asyncio.run(best_of_n.run_best_of_n("AAPL"))
+
+    assert calls == [True]
+
+
+def test_write_candidate_trace_is_a_noop_for_empty_tool_calls(isolated_candidate_trace_dir):
+    best_of_n._write_candidate_trace("a" * 32, 0, [])
+
+    assert not best_of_n.CANDIDATE_TRACE_DIR.exists()  # 没有内容，不该创建目录/文件
+
+
+def test_promote_candidate_trace_is_a_noop_when_no_short_term_file_exists(isolated_candidate_trace_dir):
+    best_of_n._promote_candidate_trace("a" * 32, 0)  # 不应该抛异常
+
+
+def test_evict_expired_candidate_traces_removes_stale_files_but_keeps_fresh_ones(isolated_candidate_trace_dir):
+    stale = best_of_n._candidate_trace_file("a" * 32, 0)
+    fresh = best_of_n._candidate_trace_file("a" * 32, 1)
+    best_of_n.CANDIDATE_TRACE_DIR.mkdir(parents=True)
+    stale.write_text('{"tool_name": "x", "output": "y"}\n')
+    fresh.write_text('{"tool_name": "x", "output": "y"}\n')
+
+    old_time = (datetime.now() - best_of_n.CANDIDATE_TRACE_TTL - timedelta(hours=1)).timestamp()
+    os.utime(stale, (old_time, old_time))
+
+    best_of_n._evict_expired_candidate_traces()
+
+    assert not stale.exists()
+    assert fresh.exists()
+
+
+def test_evict_expired_candidate_traces_tolerates_concurrent_deletion(isolated_candidate_trace_dir, monkeypatch):
+    """真实存在的竞态：两个不同session几乎同时各自发起一次深度分析，两边的
+    清理扫描可能同时扫到同一个陈旧文件——一边先删了，另一边对同一路径调
+    stat()时文件已经不存在，会抛FileNotFoundError。这个异常不该把整个清理
+    动作、进而把这次完全不相关的run_best_of_n调用一起带崩。"""
+    stale = best_of_n._candidate_trace_file("a" * 32, 0)
+    best_of_n.CANDIDATE_TRACE_DIR.mkdir(parents=True)
+    stale.write_text('{"tool_name": "x", "output": "y"}\n')
+    old_time = (datetime.now() - best_of_n.CANDIDATE_TRACE_TTL - timedelta(hours=1)).timestamp()
+    os.utime(stale, (old_time, old_time))
+
+    # 只让"stale"这一个具体路径的stat()报FileNotFoundError，不是全局劫持
+    # Path.stat——否则连CANDIDATE_TRACE_DIR.exists()自己内部调用的stat()
+    # 都会被误伤，测不出真正想验证的那个场景
+    original_stat = best_of_n.Path.stat
+
+    def fake_stat(self, *args, **kwargs):
+        if self == stale:
+            raise FileNotFoundError("另一个并发清理已经删了这个文件")
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(best_of_n.Path, "stat", fake_stat)
+
+    best_of_n._evict_expired_candidate_traces()  # 不应该抛异常

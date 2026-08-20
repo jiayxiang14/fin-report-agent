@@ -11,6 +11,7 @@ from app.api.routes import (
     peer,
     sector,
     thematic_flow,
+    trace,
 )
 
 app = FastAPI(title="US Equity Research Agent API")
@@ -31,6 +32,7 @@ app.include_router(best_of_n.router)
 app.include_router(company_profile.router)
 app.include_router(peer.router)
 app.include_router(thematic_flow.router)
+app.include_router(trace.router)
 
 
 @app.get("/health")

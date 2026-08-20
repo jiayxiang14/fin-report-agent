@@ -17,6 +17,6 @@ def test_unknown_ticker_returns_404_not_500():
         "app.api.routes.filing.get_filing_text",
         new=AsyncMock(side_effect=TickerNotFoundError("找不到 ticker")),
     ):
-        response = client.get("/api/filing-text/RARE123")
+        response = client.get("/api/filing-text/ZZRARE")
 
     assert response.status_code == 404

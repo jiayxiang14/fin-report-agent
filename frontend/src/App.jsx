@@ -1,5 +1,5 @@
 import { Search, Sparkles } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import AgentReasoningPanel from './components/AgentReasoningPanel'
 import CandidateComparisonPanel from './components/CandidateComparisonPanel'
 import CompanyProfilePanel from './components/CompanyProfilePanel'
@@ -41,6 +41,41 @@ function App() {
   const [mode, setMode] = useState('normal')
   const agent = useAgentAnalysis()
   const bestOfN = useBestOfNAnalysis()
+
+  // 断线重连：页面刷新后，agent/bestOfN两边的sessionStorage可能都存着一个
+  // 还没确认失效的task（比如先跑了一次普通分析，跑完之后又跑了一次深度
+  // 分析），只应该恢复"最后一次"那个——用各自存的startedAt比较，只接回
+  // 更晚发起的那个，避免刷新之后同时接回两条互相无关的旧流。
+  // resumeAttempted这个ref是必须的：StrictMode开发模式下这个effect会跑
+  // 两遍，resume()内部会真的开一个新的EventSource连接，不加这道守卫会
+  // 在开发模式下短暂开出两条重复订阅同一个task的连接（不会重复花钱，但
+  // 会导致log临时出现重复条目）——ref跨越StrictMode的模拟卸载/重装依然
+  // 保留，能挡住第二次真正执行。
+  const resumeAttempted = useRef(false)
+  useEffect(() => {
+    if (resumeAttempted.current) return
+    resumeAttempted.current = true
+
+    const normalSession = agent.resume()
+    const deepSession = bestOfN.resume()
+    const winner =
+      normalSession && deepSession
+        ? normalSession.startedAt >= deepSession.startedAt
+          ? { session: normalSession, mode: 'normal' }
+          : { session: deepSession, mode: 'deep' }
+        : normalSession
+          ? { session: normalSession, mode: 'normal' }
+          : deepSession
+            ? { session: deepSession, mode: 'deep' }
+            : null
+
+    if (winner) {
+      setTicker(winner.session.ticker)
+      setSubmittedTicker(winner.session.ticker)
+      setMode(winner.mode)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   function runAnalysis(nextMode) {
     const trimmed = ticker.trim().toUpperCase()

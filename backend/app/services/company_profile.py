@@ -97,25 +97,35 @@ def _compute_adr_pct(bars, window: int = ADR_WINDOW) -> float | None:
     return round(float(daily_range_pct.mean()), 2)
 
 
-async def _fetch_pe_ratio(ticker: str, latest_close: float) -> float | None:
+async def _fetch_pe_ratio(ticker: str, latest_close: float) -> tuple[float | None, str | None]:
     """市盈率 = 最新收盘价 / 最新一期年度稀释EPS。用的是最近一个完整财年的EPS，
     不是严格意义上的TTM（近四个季度滚动）——`extract_key_metrics` 目前只保留
     最新一期年度和最新一期季度两个点，没有完整的近四季度历史可供滚动求和，这是
     一个明确的简化，不是假装精确的TTM，前端要如实标注。EPS为负或缺失时P/E没有
     意义（不是"负的市盈率"），返回None。SEC EDGAR拉取失败时同样返回None——市盈率
     算不出来不应该拖垮整个公司概览请求，这是一个软性降级，不是硬错误。
+
+    返回 (pe_ratio, note)：`latest_close` 永远是美元（来自Polygon），但
+    `eps_metric.unit` 不一定是美元——境外发行人（比如NBIS）的稀释EPS可能只有
+    本币计价的数据（真实碰到过"RUB/shares"），这种情况下直接相除会算出一个
+    跨货币、完全没有意义的数字。不做汇率换算：项目没有汇率数据源，而且这类
+    情况往往还伴随着EPS数据本身是好几年前的旧口径（比如NBIS那份RUB EPS来自
+    业务重组前的FY2023），换算了汇率也解决不了口径过时的问题——如实返回
+    None并说明原因，好过算出一个看似正常、实际毫无意义的数字。
     """
     try:
         financials = await get_financials(ticker)
     except SecClientError:
-        return None
+        return None, None
     eps_metric = financials.metrics.get("eps_diluted")
     if eps_metric is None or eps_metric.latest_annual is None:
-        return None
+        return None, None
+    if not eps_metric.unit.upper().startswith("USD"):
+        return None, f"稀释每股收益的计量单位是{eps_metric.unit}，不是美元，无法直接计算市盈率（不做汇率换算）"
     eps = eps_metric.latest_annual.val
     if eps <= 0:
-        return None
-    return round(latest_close / eps, 2)
+        return None, None
+    return round(latest_close / eps, 2), None
 
 
 async def get_company_profile(ticker: str) -> CompanyProfileResponse:
@@ -138,7 +148,7 @@ async def get_company_profile(ticker: str) -> CompanyProfileResponse:
 
     adr_20d_pct = _compute_adr_pct(bars)
     latest_close = float(bars["close"].iloc[-1])
-    pe_ratio = await _fetch_pe_ratio(ticker, latest_close)
+    pe_ratio, pe_note = await _fetch_pe_ratio(ticker, latest_close)
 
     return CompanyProfileResponse(
         ticker=ticker,
@@ -150,5 +160,6 @@ async def get_company_profile(ticker: str) -> CompanyProfileResponse:
         homepage_url=details.get("homepage_url"),
         total_employees=details.get("total_employees"),
         adr_20d_pct=adr_20d_pct,
+        note=pe_note,
         pe_ratio=pe_ratio,
     )

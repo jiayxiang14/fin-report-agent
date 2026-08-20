@@ -23,13 +23,13 @@ Reflexion不是重新生成整份简报，是在同一个Agent Loop对话里多�
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
 from app.models.agent import AgentRunResult, ReasoningNote, TranscriptEntry
 from app.models.best_of_n import BestOfNResult, CandidateSummary
-from app.services.agent import reward
+from app.services.agent import reward, trace_log
 from app.services.agent.loop import OnEvent, ReflexionCheck, run_agent_loop
 from app.services.polygon_client import CACHE_DIR
 
@@ -86,6 +86,78 @@ def _make_reflexion_check(cache: dict[str, float | str | bool | None]) -> Reflex
 # 做策略学习积累数据（项目书6.1/6.4），MVP阶段不做训练
 RUNS_LOG_PATH: Path = CACHE_DIR / "best_of_n_runs.jsonl"
 
+# 候选完整工具输出的短期缓存：3个候选谁会胜出，只有等全部跑完打分选择之后
+# 才知道，所以每个候选先各自把完整（未截断）工具输出写进自己专属的短期文件，
+# 等选出胜出者后，只把*那一个候选*的记录"提升"进trace_log的永久trace文件
+# （跟单次分析路径的tool_result_full记录格式一致），其余候选的文件原地不动，
+# 靠下面的机会性过期清理自然消失——不这样做的话，3个候选都写永久trace会让
+# 磁盘增量变成单次分析路径的3倍，而且Best-of-N本身调用频率低、单次payload
+# 可能很大（get_filing_text一次真实约39万字符），不值得为了这个不常用的
+# 路径长期攒着两份没被看过的候选数据。
+CANDIDATE_TRACE_DIR: Path = CACHE_DIR / "candidate_traces"
+CANDIDATE_TRACE_TTL = timedelta(hours=24)
+
+
+def _candidate_trace_file(trace_id: str, index: int) -> Path:
+    return CANDIDATE_TRACE_DIR / f"{trace_id}_{index}.jsonl"
+
+
+def _write_candidate_trace(trace_id: str, index: int, tool_calls: list[tuple[str, str]]) -> None:
+    """候选成功跑完后一次性写入（不是逐个工具调用时写）——capture闭包在
+    Loop运行期间只做纯内存的list.append，不碰磁盘，真正的I/O被挪到这里，
+    避免任何磁盘问题拖累候选本身正在进行的Agent Loop。"""
+    if not tool_calls:
+        return
+    try:
+        CANDIDATE_TRACE_DIR.mkdir(parents=True, exist_ok=True)
+        with _candidate_trace_file(trace_id, index).open("a") as f:
+            for tool_name, output in tool_calls:
+                f.write(json.dumps({"tool_name": tool_name, "output": output}, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 - 落盘失败不能拖垮候选，跟trace_log.py同一个哲学
+        pass
+
+
+def _promote_candidate_trace(trace_id: str, index: int) -> None:
+    """胜出候选的完整工具输出从短期缓存"提升"成永久trace记录——写进
+    trace_log已有的同一个{trace_id}.jsonl文件，带上candidate_index，跟
+    task_registry落的事件级（截断summary）记录共用同一份trace，按发生
+    顺序自然穿插。提升成功后删掉短期文件，避免留两份重复数据；任何一步
+    失败都不该往外抛——这是锦上添花的可观测性数据，不是核心链路。"""
+    candidate_file = _candidate_trace_file(trace_id, index)
+    if not candidate_file.exists():
+        return
+    try:
+        for line in candidate_file.read_text().splitlines():
+            if not line:
+                continue
+            record = json.loads(line)
+            trace_log.append_event(trace_id, {"type": "tool_result_full", "candidate_index": index, **record})
+        candidate_file.unlink()
+    except Exception:  # noqa: BLE001 - 同上，提升失败不该影响这次Best-of-N运行本身
+        pass
+
+
+def _evict_expired_candidate_traces() -> None:
+    """机会性过期清理——跟task_registry._evict_expired()同一个模式，在每次
+    新的Best-of-N运行开始时顺手清一次，不需要单独的后台调度器。
+
+    真实存在的竞态：如果两个不同session几乎同时各自发起一次深度分析（session
+    并发保护只挡同一个session内部重复提交，挡不住不同session并发），两边的
+    清理扫描可能同时扫到同一个陈旧文件，一边删掉了，另一边对同一个路径调
+    stat()时文件已经不存在，会抛FileNotFoundError——这个异常必须在每个文件
+    自己的粒度上兜住，不能让它把整个清理动作、进而把这次完全不相关的
+    run_best_of_n调用一起带崩。
+    """
+    if not CANDIDATE_TRACE_DIR.exists():
+        return
+    cutoff = datetime.now() - CANDIDATE_TRACE_TTL
+    for f in CANDIDATE_TRACE_DIR.glob("*.jsonl"):
+        try:
+            if datetime.fromtimestamp(f.stat().st_mtime) < cutoff:
+                f.unlink(missing_ok=True)
+        except OSError:  # 另一个并发清理已经删了这个文件，或者其它瞬时文件系统问题
+            continue
+
 
 def _with_candidate_index(on_event: OnEvent | None, index: int) -> OnEvent | None:
     if on_event is None:
@@ -110,7 +182,7 @@ def _append_run_log(ticker: str, candidates: list[CandidateSummary], selected_in
 
 
 async def _run_candidate(
-    ticker: str, index: int, temperature: float, on_event: OnEvent | None
+    ticker: str, index: int, temperature: float, on_event: OnEvent | None, trace_id: str | None = None
 ) -> tuple[CandidateSummary, AgentRunResult | None]:
     """跑一个候选的完整生命周期：Agent Loop（内含条件性Reflexion）→ 三项打分 →
     组装CandidateSummary。返回(summary, run_result)，失败时run_result是None——
@@ -122,11 +194,18 @@ async def _run_candidate(
             await on_event(event)
 
     raw_outputs: list[str] = []
+    full_tool_calls: list[tuple[str, str]] = []
     trajectory_cache: dict[str, float | str | bool | None] = {}
 
     async def capture(tool_name: str, content: str) -> None:
         raw_outputs.append(content)
+        full_tool_calls.append((tool_name, content))
 
+    # 用None初始化：区分下面except捕获到异常时，究竟是run_agent_loop本身没
+    # 跑完（run_result还是None），还是loop已经成功、是后面的打分阶段出了
+    # 问题（run_result已经被赋值）——两种情况的诊断信息不一样，日志里应该
+    # 说清楚，不能都含糊地说成"这个候选失败了"
+    run_result: AgentRunResult | None = None
     try:
         run_result = await run_agent_loop(
             ticker,
@@ -135,9 +214,69 @@ async def _run_candidate(
             on_tool_result=capture,
             reflexion_check=_make_reflexion_check(trajectory_cache),
         )
-    except Exception as exc:  # noqa: BLE001 - 单个候选失败（比如上游余额不足/网络错误）
-        # 不该让已经跑完、真花了钱的其它候选也被整批扔掉，跳过这一个继续下一个
-        error_message = str(exc)
+
+        # 落到候选专属的短期缓存，不是永久trace——这时候还不知道这个候选会不会
+        # 被选中，只有run_best_of_n算完选择结果后，胜出候选才会被"提升"成永久
+        # 记录。放在打分之前写：即使后面打分阶段失败，候选的完整工具输出依然
+        # 被捕获下来了，不会因为打分这一步的问题而丢失排查线索。
+        if trace_id is not None:
+            _write_candidate_trace(trace_id, index, full_tool_calls)
+
+        rule_score = reward.score_rule_based(run_result, raw_outputs)
+        llm_score, llm_reason = await reward.score_llm_judge(run_result.final_report)
+
+        # Reflexion没触发时，run_agent_loop内部最后一次end_turn检查用的
+        # reasoning_notes/transcript就是run_result里的最终状态，trajectory_cache
+        # 里已经有现成的分数，不用再问一遍过程裁判；触发过的话状态已经变了
+        # （多了一轮整改），必须用新状态重新打分才准确
+        if trajectory_cache.get("computed") and not run_result.reflexion_triggered:
+            trajectory_score = cast("float | None", trajectory_cache["score"])
+            trajectory_reason = cast("str | None", trajectory_cache["reason"])
+        else:
+            trajectory_score, trajectory_reason = await reward.score_trajectory_judge(
+                run_result.reasoning_notes, run_result.transcript
+            )
+
+        total_score = reward.combine_scores(rule_score, llm_score, trajectory_score)
+
+        summary = CandidateSummary(
+            index=index,
+            temperature=temperature,
+            completed=run_result.completed,
+            final_report=run_result.final_report,
+            rule_score=rule_score,
+            llm_score=llm_score,
+            llm_reason=llm_reason,
+            trajectory_score=trajectory_score,
+            trajectory_reason=trajectory_reason,
+            reflexion_triggered=run_result.reflexion_triggered,
+            total_score=total_score,
+        )
+
+        await emit(
+            {
+                "type": "candidate_scored",
+                "candidate_index": index,
+                "temperature": temperature,
+                "total_score": total_score,
+                "rule_score": rule_score.model_dump(),
+                "llm_score": llm_score,
+                "llm_reason": llm_reason,
+                "trajectory_score": trajectory_score,
+                "trajectory_reason": trajectory_reason,
+                "reflexion_triggered": run_result.reflexion_triggered,
+            }
+        )
+
+        return summary, run_result
+    except Exception as exc:  # noqa: BLE001 - 单个候选（Agent Loop本身，或者跑完之后的打分阶段）
+        # 失败都不该拖垮整批——之前try/except只包住了run_agent_loop这一步，
+        # 打分阶段（reward.score_rule_based等）如果抛异常会直接从这个函数
+        # 里逃出去，顺着asyncio.gather把已经成功、真花了钱的其它候选结果
+        # 也一起炸没，跟这段代码自己的设计承诺（"单个候选失败不拖垮整批"）
+        # 矛盾——真实故障注入复现过这个后果。现在扩大到覆盖整个候选生命周期。
+        stage = "打分阶段" if run_result is not None else "Agent Loop 本身"
+        error_message = f"[{stage}失败] {exc}"
         await emit(
             {
                 "type": "candidate_failed",
@@ -151,59 +290,15 @@ async def _run_candidate(
             None,
         )
 
-    rule_score = reward.score_rule_based(run_result, raw_outputs)
-    llm_score, llm_reason = await reward.score_llm_judge(run_result.final_report)
 
-    # Reflexion没触发时，run_agent_loop内部最后一次end_turn检查用的
-    # reasoning_notes/transcript就是run_result里的最终状态，trajectory_cache
-    # 里已经有现成的分数，不用再问一遍过程裁判；触发过的话状态已经变了
-    # （多了一轮整改），必须用新状态重新打分才准确
-    if trajectory_cache.get("computed") and not run_result.reflexion_triggered:
-        trajectory_score = cast("float | None", trajectory_cache["score"])
-        trajectory_reason = cast("str | None", trajectory_cache["reason"])
-    else:
-        trajectory_score, trajectory_reason = await reward.score_trajectory_judge(
-            run_result.reasoning_notes, run_result.transcript
-        )
+async def run_best_of_n(ticker: str, on_event: OnEvent | None = None, trace_id: str | None = None) -> BestOfNResult:
+    """`trace_id`跟`agent.py`路由那次用的是同一个task_id——不传时（比如脚本/
+    测试直接调用）整个候选trace机制原样跳过，行为不变。"""
+    _evict_expired_candidate_traces()
 
-    total_score = reward.combine_scores(rule_score, llm_score, trajectory_score)
-
-    summary = CandidateSummary(
-        index=index,
-        temperature=temperature,
-        completed=run_result.completed,
-        final_report=run_result.final_report,
-        rule_score=rule_score,
-        llm_score=llm_score,
-        llm_reason=llm_reason,
-        trajectory_score=trajectory_score,
-        trajectory_reason=trajectory_reason,
-        reflexion_triggered=run_result.reflexion_triggered,
-        total_score=total_score,
-    )
-
-    await emit(
-        {
-            "type": "candidate_scored",
-            "candidate_index": index,
-            "temperature": temperature,
-            "total_score": total_score,
-            "rule_score": rule_score.model_dump(),
-            "llm_score": llm_score,
-            "llm_reason": llm_reason,
-            "trajectory_score": trajectory_score,
-            "trajectory_reason": trajectory_reason,
-            "reflexion_triggered": run_result.reflexion_triggered,
-        }
-    )
-
-    return summary, run_result
-
-
-async def run_best_of_n(ticker: str, on_event: OnEvent | None = None) -> BestOfNResult:
     results = await asyncio.gather(
         *(
-            _run_candidate(ticker, index, temperature, on_event)
+            _run_candidate(ticker, index, temperature, on_event, trace_id)
             for index, temperature in enumerate(CANDIDATE_TEMPERATURES)
         )
     )
@@ -222,6 +317,9 @@ async def run_best_of_n(ticker: str, on_event: OnEvent | None = None) -> BestOfN
     # 这个字段在模型上留 Optional 是给失败候选（不在 successful 里）用的
     best_summary, best_run_result = max(successful, key=lambda pair: cast(float, pair[0].total_score))
     _append_run_log(ticker, candidates, best_summary.index)
+
+    if trace_id is not None:
+        _promote_candidate_trace(trace_id, best_summary.index)
 
     return BestOfNResult(
         ticker=ticker,

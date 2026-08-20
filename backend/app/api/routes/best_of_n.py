@@ -1,64 +1,46 @@
-import asyncio
-import contextlib
-import json
+import uuid
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
+from app.api.rate_limit import enforce_rate_limit
+from app.api.session_guard import enforce_single_in_flight_request, release_in_flight_request
+from app.api.ticker_path import TickerPath
+from app.services.agent import task_registry
 from app.services.agent.best_of_n import run_best_of_n
 
 router = APIRouter(prefix="/api/analyze", tags=["best_of_n"])
 
 
-def _sse(event: dict) -> str:
-    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+@router.post("/{ticker}/best-of-n/start", dependencies=[Depends(enforce_rate_limit)])
+async def start_best_of_n(
+    ticker: TickerPath,
+    session_id: str | None = Depends(enforce_single_in_flight_request),
+) -> dict:
+    """跟 agent.py 的 `/start` 同一套task_registry实现——Best-of-N一次要跑3次
+    完整Agent Loop+最多3次裁判调用，成本比普通分析高得多，断线重连更不能
+    默默变成"重新触发一次"，跟普通分析共用同一个任务注册表（task_id全局
+    唯一，注册表不关心是哪种分析）。session并发保护同样共用一份状态——同一个
+    浏览器标签页不该同时既跑一次普通分析又跑一次深度分析，两者对Alpha
+    Vantage/Polygon是同一批共享配额。
 
-
-@router.get("/{ticker}/best-of-n/stream")
-async def analyze_ticker_best_of_n_stream(ticker: str) -> StreamingResponse:
-    """跟 agent.py 的 `/stream` 端点同一套"asyncio.Queue桥接on_event"实现，
-    是一个独立的新端点而不是替换普通分析：Best-of-N一次要跑3次完整Agent Loop
-    +最多3次裁判调用，API调用量/花费大约是普通分析的4倍，不能默默变成默认
-    行为，用户需要能明确选择要不要用这个更贵的"深度分析"模式。
-
-    run_best_of_n内部现在是并行跑3个候选（asyncio.gather，靠cache_lock保证
-    并发访问同一份磁盘缓存安全），所以墙钟延迟不再是"4倍"那么夸张——三个候选
-    的事件会按各自真实产生的时间交错到达这个队列里，不是排队等前一个候选
-    完全跑完才轮到下一个。这里只是原样把队列里的事件转发成SSE帧，不关心
-    到达顺序，前端本来就按candidate_index分桶处理，天然兼容交错到达。
-
-    事件在 run_best_of_n/run_agent_loop 已有的 reasoning/tool_call_started/
-    tool_call_finished 基础上多带一个 candidate_index 字段区分是哪个候选，
-    新增 candidate_scored（一个候选跑完+打分后发出），最终 done 携带完整的
-    BestOfNResult。
+    提前生成task_id（不让task_registry.start_task内部生成）并传给
+    run_best_of_n当trace_id——胜出候选的完整工具输出会被提升进这个task_id
+    对应的trace文件，跟task_registry落的事件级记录共用同一份。
     """
+    task_id = uuid.uuid4().hex
 
-    async def event_generator():
-        queue: asyncio.Queue = asyncio.Queue()
-
-        async def on_event(event: dict) -> None:
-            await queue.put(event)
-
-        async def run() -> None:
-            try:
-                result = await run_best_of_n(ticker, on_event=on_event)
-                await queue.put({"type": "done", "result": result.model_dump()})
-            except Exception as exc:  # noqa: BLE001 - 流式端点的失败边界
-                await queue.put({"type": "error", "message": str(exc)})
-            finally:
-                await queue.put(None)
-
-        task = asyncio.create_task(run())
+    async def runner(on_event: task_registry.OnEvent) -> dict:
         try:
-            while True:
-                event = await queue.get()
-                if event is None:
-                    break
-                yield _sse(event)
+            result = await run_best_of_n(ticker, on_event=on_event, trace_id=task_id)
+            return result.model_dump()
         finally:
-            if not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            release_in_flight_request(session_id)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    task_registry.start_task(ticker, runner, task_id=task_id)
+    return {"task_id": task_id}
+
+
+@router.get("/best-of-n/stream/{task_id}")
+async def analyze_best_of_n_stream(task_id: str) -> StreamingResponse:
+    return task_registry.stream_task(task_id)

@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { getSessionId } from '../lib/clientSession'
+import { clearTaskSession, loadTaskSession, saveTaskSession } from '../lib/sessionTask'
 import { useElapsedTimer } from './useElapsedTimer'
+
+const SESSION_KEY = 'fin-report-agent:deep-task'
 
 // candidate_scored事件（跑的过程中实时到）不带简报正文——只有等done事件里
 // 完整的 BestOfNResult.candidates 才有 final_report。这里统一成一个映射函数，
@@ -30,6 +34,8 @@ function mapDoneCandidate(raw) {
 // 把"胜出候选"自己的那一份日志挑出来喂给 AgentReasoningPanel——这样深度分析
 // 模式下用户看到的推理过程就是真正被选中展示的那份简报是怎么一步步生成的，
 // 而不是一个空面板。
+//
+// 断线重连：跟 useAgentAnalysis 同一套 start()/resume() 拆分，见那边的注释。
 export function useBestOfNAnalysis() {
   const [candidates, setCandidates] = useState([])
   const [result, setResult] = useState(null)
@@ -48,7 +54,7 @@ export function useBestOfNAnalysis() {
     }
   }, [stopTimer])
 
-  const start = useCallback((ticker) => {
+  const attach = useCallback((ticker, taskId) => {
     sourceRef.current?.close()
     setCandidates([])
     setResult(null)
@@ -59,7 +65,7 @@ export function useBestOfNAnalysis() {
     nextKeyRef.current = 0
     startTimer()
 
-    const source = new EventSource(`/api/analyze/${ticker}/best-of-n/stream`)
+    const source = new EventSource(`/api/analyze/best-of-n/stream/${taskId}`)
     sourceRef.current = source
 
     function appendToCandidateLog(candidateIndex, entry) {
@@ -142,6 +148,9 @@ export function useBestOfNAnalysis() {
           source.close()
           break
         case 'error':
+          if (event.code === 'task_not_found') {
+            clearTaskSession(SESSION_KEY)
+          }
           setStreamError(event.message)
           setDone(true)
           stopTimer()
@@ -162,5 +171,48 @@ export function useBestOfNAnalysis() {
     }
   }, [startTimer, stopTimer])
 
-  return { candidates, result, selectedLog, streamError, done, elapsedMs, start }
+  const start = useCallback(
+    async (ticker) => {
+      setResult(null)
+      setStreamError(null)
+      setDone(false)
+
+      const sessionId = getSessionId()
+      const headers = sessionId ? { 'X-Session-Id': sessionId } : {}
+
+      let response
+      try {
+        response = await fetch(`/api/analyze/${ticker}/best-of-n/start`, { method: 'POST', headers })
+      } catch {
+        setStreamError('发起分析失败：无法连接服务器')
+        setDone(true)
+        return
+      }
+      if (!response.ok) {
+        let detail = '发起分析失败，请稍后重试'
+        try {
+          const body = await response.json()
+          if (body.detail) detail = body.detail
+        } catch {
+          // 响应体不是JSON，用默认文案
+        }
+        setStreamError(detail)
+        setDone(true)
+        return
+      }
+      const { task_id: taskId } = await response.json()
+      saveTaskSession(SESSION_KEY, { ticker, taskId, startedAt: Date.now() })
+      attach(ticker, taskId)
+    },
+    [attach]
+  )
+
+  const resume = useCallback(() => {
+    const session = loadTaskSession(SESSION_KEY)
+    if (!session) return null
+    attach(session.ticker, session.taskId)
+    return session
+  }, [attach])
+
+  return { candidates, result, selectedLog, streamError, done, elapsedMs, start, resume }
 }

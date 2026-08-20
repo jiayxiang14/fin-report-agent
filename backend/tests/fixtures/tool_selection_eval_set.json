@@ -1,0 +1,111 @@
+[
+  {
+    "ticker": "AAPL",
+    "expected_tools": [
+      "get_financials",
+      "get_sector_position",
+      "get_peer_comparison",
+      "get_filing_text",
+      "get_price_reaction",
+      "get_earnings_surprise"
+    ],
+    "notes": "普通大盘股对照组，XLK板块，不在任何AI基建主题篮子里，get_thematic_flow不该调用。有个真实核实过的陷阱：AAPL在Polygon的sic_description是'ELECTRONIC COMPUTERS'，恰好命中thematic_flow.py里SIC_KEYWORD_THEMES的'服务器ODM'关键词——如果真调用了这个工具，会意外返回一个非空的matched_themes，但这不代表'该调用'是对的：这里评的是Agent该不该主动决定调用这个工具（工具描述要求先判断业务是否处于AI算力产业链），不是调用后SIC匹配巧不巧合命中，苹果的核心业务是消费电子，不是服务器代工。",
+    "last_verified": "2026-08-20"
+  },
+  {
+    "ticker": "KO",
+    "expected_tools": [
+      "get_financials",
+      "get_sector_position",
+      "get_peer_comparison",
+      "get_filing_text",
+      "get_price_reaction",
+      "get_earnings_surprise"
+    ],
+    "notes": "非科技消费股对照组（XLP板块），跟AI基建完全无关，get_thematic_flow不该调用——跟eval_report_quality.py默认评测集里用KO当非科技对照的思路一致。",
+    "last_verified": "2026-08-20"
+  },
+  {
+    "ticker": "NVDA",
+    "expected_tools": [
+      "get_financials",
+      "get_sector_position",
+      "get_peer_comparison",
+      "get_filing_text",
+      "get_price_reaction",
+      "get_earnings_surprise",
+      "get_thematic_flow"
+    ],
+    "notes": "THEMATIC_BASKETS['AI芯片/GPU']的成分股，get_thematic_flow该调用且matched_themes该非空——这是最直接、最不该漏调的一个信号。",
+    "last_verified": "2026-08-20"
+  },
+  {
+    "ticker": "MU",
+    "expected_tools": [
+      "get_financials",
+      "get_sector_position",
+      "get_peer_comparison",
+      "get_filing_text",
+      "get_price_reaction",
+      "get_earnings_surprise",
+      "get_thematic_flow"
+    ],
+    "notes": "THEMATIC_BASKETS['存储']的成分股，SIC也是'SEMICONDUCTORS & RELATED DEVICES'（真实核实过缓存数据），get_thematic_flow该调用。",
+    "last_verified": "2026-08-20"
+  },
+  {
+    "ticker": "AMZN",
+    "expected_tools": [
+      "get_financials",
+      "get_sector_position",
+      "get_peer_comparison",
+      "get_filing_text",
+      "get_price_reaction",
+      "get_earnings_surprise",
+      "get_thematic_flow"
+    ],
+    "notes": "双重身份的例子：XLY板块（零售电商），但也是THEMATIC_BASKETS['云计算']的成分股（AWS是AI资本开支主体）——测的是Agent会不会因为板块归类是零售就漏掉云计算这条线，get_thematic_flow该调用。",
+    "last_verified": "2026-08-20"
+  },
+  {
+    "ticker": "NBIS",
+    "expected_tools": [
+      "get_financials",
+      "get_sector_position",
+      "get_peer_comparison",
+      "get_filing_text",
+      "get_price_reaction",
+      "get_earnings_surprise",
+      "get_thematic_flow"
+    ],
+    "notes": "境外私人发行人（get_filing_text该走20-F兜底，不是10-K），不在PRESET_TICKER_SECTOR_MAP预设股票池里，也不在THEMATIC_BASKETS任何一个篮子的成分股名单里，Polygon的sic_description是None（真实核实过缓存数据）——两层确定性匹配都会落空。但Nebius的真实业务就是AI云计算/GPU算力服务，这是这份评测集里最考验判断力的一条：get_thematic_flow依然该调用（工具描述里写了'如果是空的，你需要结合已经了解到的公司业务自己判断'），调用后matched_themes是空的才是正确结果，不是'不该调用'。get_sector_position/get_peer_comparison同理，即使预计会返回'不在预设股票池'的note，主动调用一次去确认仍然是合理动作。",
+    "last_verified": "2026-08-20"
+  },
+  {
+    "ticker": "RKLB",
+    "expected_tools": [
+      "get_financials",
+      "get_sector_position",
+      "get_peer_comparison",
+      "get_filing_text",
+      "get_price_reaction",
+      "get_earnings_surprise"
+    ],
+    "notes": "航天公司，不在预设股票池、不在任何主题篮子——用来跟NBIS对照：同样是'两层匹配都落空'，但这里的正确判断是get_thematic_flow真的不该调用（航天发射业务跟AI算力产业链没有实质关联，不是NBIS那种'匹配不到但业务真相关'的情况）。",
+    "last_verified": "2026-08-20"
+  },
+  {
+    "ticker": "GOOGL",
+    "expected_tools": [
+      "get_financials",
+      "get_sector_position",
+      "get_peer_comparison",
+      "get_filing_text",
+      "get_price_reaction",
+      "get_earnings_surprise",
+      "get_thematic_flow"
+    ],
+    "notes": "XLC板块，同时是THEMATIC_BASKETS['云计算']成分股——第二个云计算例子，用来跟AMZN对照确认'云计算'这条线不是偶然被AMZN一个ticker蒙对的。",
+    "last_verified": "2026-08-20"
+  }
+]

@@ -207,6 +207,122 @@ def test_llm_judge_skips_call_when_no_report():
     assert result == (None, None)
 
 
+def test_llm_judge_averages_scores_across_self_consistency_samples():
+    """轻量自我一致性：裁判现在对同一个prompt并发采样JUDGE_SAMPLE_COUNT次取平均，
+    不是只发一次请求。这里用一个调用计数器让每次返回不同的分数，验证最终结果
+    确实是平均值，不是随便挑了某一次的结果。"""
+    scores_by_call = iter([6, 8, 10])
+
+    class FakeLLM:
+        async def create_message(self, system, messages, tools, temperature=None):
+            score = next(scores_by_call)
+            return LLMResponse(
+                stop_reason="end_turn", text=f"<reason>理由{score}</reason>\n<score>{score}</score>", tool_calls=[], raw=None
+            )
+
+    with patch("app.services.agent.reward.get_llm_client", return_value=FakeLLM()):
+        score, reason = asyncio.run(reward.score_llm_judge("<conclusion>a</conclusion>"))
+
+    assert reward.JUDGE_SAMPLE_COUNT == 3  # 断言依赖的采样次数没有被悄悄改掉
+    assert score == 80.0  # (60+80+100)/3
+    assert reason is not None
+
+
+def test_llm_judge_ensemble_ignores_failed_samples_when_averaging():
+    """3次采样里只要有一次解析失败（格式不对/调用报错），不该让整体退化成
+    None——应该只用成功的那几次求平均，跟单次裁判"失败就整体降级"的哲学
+    是两回事：这里"部分失败"不等于"全部失败"。"""
+    call_count = {"n": 0}
+
+    class FakeLLM:
+        async def create_message(self, system, messages, tools, temperature=None):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                return LLMResponse(stop_reason="end_turn", text="没按格式回复", tool_calls=[], raw=None)
+            return LLMResponse(
+                stop_reason="end_turn", text="<reason>ok</reason>\n<score>8</score>", tool_calls=[], raw=None
+            )
+
+    with patch("app.services.agent.reward.get_llm_client", return_value=FakeLLM()):
+        score, reason = asyncio.run(reward.score_llm_judge("<conclusion>a</conclusion>"))
+
+    assert score == 80.0
+    assert reason == "ok"
+
+
+def test_llm_judge_ensemble_samples_use_nonzero_temperature():
+    """自我一致性必须配非零温度，否则重复采样会得到几乎相同的单点结果，
+    失去"降低方差"这个意义——验证确实把JUDGE_SAMPLE_TEMPERATURE传给了
+    create_message，不是继续用之前单次裁判用的temperature=0.0。"""
+    captured_temperatures: list[float | None] = []
+
+    class FakeLLM:
+        async def create_message(self, system, messages, tools, temperature=None):
+            captured_temperatures.append(temperature)
+            return LLMResponse(
+                stop_reason="end_turn", text="<reason>ok</reason>\n<score>7</score>", tool_calls=[], raw=None
+            )
+
+    with patch("app.services.agent.reward.get_llm_client", return_value=FakeLLM()):
+        asyncio.run(reward.score_llm_judge("<conclusion>a</conclusion>"))
+
+    assert captured_temperatures == [reward.JUDGE_SAMPLE_TEMPERATURE] * reward.JUDGE_SAMPLE_COUNT
+
+
+def test_judge_prompt_requires_reasoning_before_score():
+    """G-Eval式"先推理后打分"：分数标签必须出现在理由标签之后，这样分数
+    才是以模型自己刚写出的推理为条件生成的，不是先斩后奏的场面话。"""
+    rendered = reward._JUDGE_PROMPT_TEMPLATE.format(report="x")
+    assert rendered.index("<reason>") < rendered.index("<score>")
+
+    rendered_trajectory = reward._TRAJECTORY_JUDGE_PROMPT_TEMPLATE.format(trajectory="x")
+    assert rendered_trajectory.index("<reason>") < rendered_trajectory.index("<score>")
+
+
+def test_judge_uses_settings_judge_provider_when_configured(monkeypatch):
+    """裁判可以配置成走跟生成不同的供应商（减少自评偏好嫌疑）——这里验证
+    `settings.judge_llm_provider`确实被传给了`get_llm_client`，不是被忽略。"""
+    monkeypatch.setattr("app.services.agent.reward.settings.judge_llm_provider", "claude")
+    captured_provider = None
+
+    class FakeLLM:
+        async def create_message(self, system, messages, tools, temperature=None):
+            return LLMResponse(
+                stop_reason="end_turn", text="<score>7</score><reason>ok</reason>", tool_calls=[], raw=None
+            )
+
+    def fake_get_llm_client(provider=None):
+        nonlocal captured_provider
+        captured_provider = provider
+        return FakeLLM()
+
+    with patch("app.services.agent.reward.get_llm_client", new=fake_get_llm_client):
+        asyncio.run(reward.score_llm_judge("<conclusion>a</conclusion>"))
+
+    assert captured_provider == "claude"
+
+
+def test_judge_uses_default_provider_when_not_configured(monkeypatch):
+    monkeypatch.setattr("app.services.agent.reward.settings.judge_llm_provider", "")
+    captured_provider = "not called"
+
+    class FakeLLM:
+        async def create_message(self, system, messages, tools, temperature=None):
+            return LLMResponse(
+                stop_reason="end_turn", text="<score>7</score><reason>ok</reason>", tool_calls=[], raw=None
+            )
+
+    def fake_get_llm_client(provider=None):
+        nonlocal captured_provider
+        captured_provider = provider
+        return FakeLLM()
+
+    with patch("app.services.agent.reward.get_llm_client", new=fake_get_llm_client):
+        asyncio.run(reward.score_llm_judge("<conclusion>a</conclusion>"))
+
+    assert captured_provider is None
+
+
 def test_trajectory_judge_parses_well_formed_response():
     class FakeLLM:
         async def create_message(self, system, messages, tools, temperature=None):

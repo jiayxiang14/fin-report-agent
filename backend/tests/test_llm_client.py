@@ -12,10 +12,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import anthropic
 import pytest
 
+from app.core.config import settings
 from app.services.agent.llm_client import (
+    CLAUDE_BASE_URL,
     CONNECTION_RETRY_ATTEMPTS,
+    DEEPSEEK_BASE_URL,
     REQUEST_TIMEOUT_SECONDS,
     AnthropicCompatibleClient,
+    get_llm_client,
 )
 
 
@@ -87,3 +91,28 @@ def test_does_not_retry_non_connection_errors():
         asyncio.run(client.create_message(system="s", messages=[], tools=[]))
 
     assert client._client.messages.create.call_count == 1
+
+
+def test_get_llm_client_defaults_to_settings_provider(monkeypatch):
+    monkeypatch.setattr(settings, "llm_provider", "deepseek")
+    monkeypatch.setattr(settings, "deepseek_api_key", "key")
+
+    client = get_llm_client()
+
+    assert client._client.base_url == DEEPSEEK_BASE_URL + "/"
+
+
+def test_get_llm_client_explicit_provider_overrides_settings(monkeypatch):
+    """Best-of-N 裁判可以走跟生成不同的供应商（减少自评偏好嫌疑）——这里验证
+    显式传入的 provider 确实覆盖了 settings.llm_provider，不是被忽略。"""
+    monkeypatch.setattr(settings, "llm_provider", "deepseek")
+    monkeypatch.setattr(settings, "anthropic_api_key", "key")
+
+    client = get_llm_client("claude")
+
+    assert str(client._client.base_url) == CLAUDE_BASE_URL
+
+
+def test_get_llm_client_rejects_unknown_provider():
+    with pytest.raises(ValueError, match="不支持的 LLM_PROVIDER"):
+        get_llm_client("bedrock")

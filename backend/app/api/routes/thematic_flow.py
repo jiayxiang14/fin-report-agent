@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException
 
+from app.api.ticker_path import TickerQuery
 from app.models.thematic_flow import ThematicFlowResponse
 from app.services.thematic_flow import ThematicFlowError, get_thematic_flow
 
@@ -7,7 +8,7 @@ router = APIRouter(prefix="/api/thematic-flow", tags=["thematic_flow"])
 
 
 @router.get("", response_model=ThematicFlowResponse)
-async def read_thematic_flow(ticker: str | None = None) -> ThematicFlowResponse:
+async def read_thematic_flow(ticker: TickerQuery = None) -> ThematicFlowResponse:
     """展示的始终是同样这10个AI算力/基建细分主题的当前相对轮动位置，跟具体
     分析哪家公司无关——`ticker`是可选查询参数，传了就顺带做一次确定性反查
     （这个ticker本身是不是某个主题篮子的成分股，见`matched_themes`），不传

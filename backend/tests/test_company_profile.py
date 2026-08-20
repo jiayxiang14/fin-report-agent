@@ -18,13 +18,13 @@ from app.services.polygon_client import PolygonClientError
 from app.services.sec_client import SecClientError
 
 
-def _fake_financials(eps: float | None) -> FinancialsResponse:
+def _fake_financials(eps: float | None, unit: str = "USD/shares") -> FinancialsResponse:
     metrics = {}
     if eps is not None:
         metrics["eps_diluted"] = FinancialMetric(
             tag="EarningsPerShareDiluted",
             label="稀释每股收益",
-            unit="USD/shares",
+            unit=unit,
             latest_annual=MetricPoint(end="2025-12-31", val=eps, form="10-K", filed="2026-02-01"),
         )
     return FinancialsResponse(
@@ -119,6 +119,28 @@ def test_pe_ratio_is_none_when_eps_is_negative():
         result = asyncio.run(get_company_profile("AMZN"))
 
     assert result.pe_ratio is None  # 亏损公司的市盈率没有意义，不是负数
+
+
+def test_pe_ratio_is_none_when_eps_unit_is_not_usd():
+    """真实复现过的bug（NBIS）：股价（latest_close）永远是Polygon给的美元，
+    但境外发行人的稀释EPS可能只有本币计价的数据（比如"RUB/shares"）——直接
+    相除会算出一个跨货币、完全没有意义的市盈率（比如259.2美元/53.26卢布=4.87，
+    看起来正常实际毫无意义）。这里不该硬算，应该如实返回None并在note里说明。"""
+    details = {"name": "Nebius Group N.V."}
+    bars = _bars([259.2] * 25, [265.0] * 25, [255.0] * 25)
+    with (
+        patch("app.services.company_profile.fetch_ticker_details", new=AsyncMock(return_value=details)),
+        patch("app.services.company_profile.fetch_daily_bars", new=AsyncMock(return_value=bars)),
+        patch(
+            "app.services.company_profile.get_financials",
+            new=AsyncMock(return_value=_fake_financials(eps=53.26, unit="RUB/shares")),
+        ),
+    ):
+        result = asyncio.run(get_company_profile("NBIS"))
+
+    assert result.pe_ratio is None
+    assert result.note is not None
+    assert "RUB/shares" in result.note
 
 
 def test_pe_ratio_is_none_when_financials_fetch_fails():

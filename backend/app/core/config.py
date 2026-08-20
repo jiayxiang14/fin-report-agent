@@ -20,6 +20,10 @@ class Settings(BaseSettings):
 
     llm_provider: str = "deepseek"  # "deepseek" 或 "claude"，切换供应商只改这个
     llm_model: str = ""  # 留空则用每个供应商各自的默认模型
+    # 留空表示 Best-of-N 的 LLM 裁判跟报告生成用同一个供应商（现状）；填
+    # "claude"/"deepseek" 可以让裁判走跟生成不同的供应商，减少"用同一个模型
+    # 评自己生成的内容"这种自评偏好嫌疑——需要对应供应商的 API Key 已配置
+    judge_llm_provider: str = ""
 
 
 settings = Settings()

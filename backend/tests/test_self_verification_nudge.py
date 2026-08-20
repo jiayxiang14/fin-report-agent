@@ -3,6 +3,10 @@
 没调用过 verify_number 时，插入一条提示强制再走一轮，并且把这个信号通过
 AgentRunResult.self_verification_triggered 暴露出去，不再只有 Best-of-N 内部
 打分能看到。
+
+这里的fixture都先走一轮get_financials、report文本都带全三个标签——不这样做的话
+会先被结构合规gate/工具使用底线gate拦下来（见test_structure_gate_nudge.py/
+test_tool_coverage_gate_nudge.py），这个文件只关心自我核查这一件事。
 """
 
 import asyncio
@@ -33,20 +37,32 @@ def _tool_call_result(name: str, is_error: bool = False) -> tuple[str, bool]:
     return ("{}", is_error)
 
 
+def _financials_call(call_id: str = "0") -> ToolCall:
+    return ToolCall(id=call_id, name="get_financials", input={"ticker": "AAPL"})
+
+
+def _full_report(conclusion: str) -> str:
+    return f"<conclusion>{conclusion}</conclusion><evidence>e</evidence><flags>f</flags>"
+
+
 def test_nudge_injected_when_ending_without_ever_calling_verify_number():
     responses = [
-        LLMResponse(stop_reason="end_turn", text="<conclusion>结论</conclusion>", tool_calls=[], raw=None),
-        LLMResponse(stop_reason="end_turn", text="<conclusion>结论（修订）</conclusion>", tool_calls=[], raw=None),
+        LLMResponse(stop_reason="tool_use", text=None, tool_calls=[_financials_call()], raw=None),
+        LLMResponse(stop_reason="end_turn", text=_full_report("结论"), tool_calls=[], raw=None),
+        LLMResponse(stop_reason="end_turn", text=_full_report("结论（修订）"), tool_calls=[], raw=None),
     ]
     fake = FakeLLMClient(responses)
-    with patch("app.services.agent.loop.get_llm_client", return_value=fake):
+    with (
+        patch("app.services.agent.loop.get_llm_client", return_value=fake),
+        patch("app.services.agent.loop.execute_tool", new=AsyncMock(return_value=_tool_call_result("get_financials"))),
+    ):
         result = asyncio.run(run_agent_loop("AAPL"))
 
-    # 模型第一次想结束时被拦了一次，第二轮才是真正的收尾——发生了2次create_message调用
-    assert fake.calls == 2
+    # 工具调用轮 + 模型第一次想结束时被拦了一次 + 第二轮才是真正的收尾，3次create_message调用
+    assert fake.calls == 3
     assert result.completed is True
     assert result.self_verification_triggered is False
-    assert result.final_report == "<conclusion>结论（修订）</conclusion>"
+    assert result.final_report == _full_report("结论（修订）")
 
 
 def test_no_nudge_when_verify_number_already_called():
@@ -55,15 +71,16 @@ def test_no_nudge_when_verify_number_already_called():
             stop_reason="tool_use",
             text=None,
             tool_calls=[
+                _financials_call(),
                 ToolCall(
                     id="1",
                     name="verify_number",
                     input={"ticker": "AAPL", "metric": "revenue", "claimed_value": 1.0, "period": "annual"},
-                )
+                ),
             ],
             raw=None,
         ),
-        LLMResponse(stop_reason="end_turn", text="<conclusion>结论</conclusion>", tool_calls=[], raw=None),
+        LLMResponse(stop_reason="end_turn", text=_full_report("结论"), tool_calls=[], raw=None),
     ]
     fake = FakeLLMClient(responses)
     with (
@@ -82,14 +99,18 @@ def test_nudge_does_not_retrigger_if_model_still_skips_verification():
     """模型被拦了一次之后，如果依然不调用 verify_number 就再次end_turn，不应该
     无限重复插入提示——只拦一次，第二次直接放行，避免死循环吃满max_turns。"""
     responses = [
-        LLMResponse(stop_reason="end_turn", text="<conclusion>结论</conclusion>", tool_calls=[], raw=None),
-        LLMResponse(stop_reason="end_turn", text="<conclusion>结论</conclusion>", tool_calls=[], raw=None),
+        LLMResponse(stop_reason="tool_use", text=None, tool_calls=[_financials_call()], raw=None),
+        LLMResponse(stop_reason="end_turn", text=_full_report("结论"), tool_calls=[], raw=None),
+        LLMResponse(stop_reason="end_turn", text=_full_report("结论"), tool_calls=[], raw=None),
     ]
     fake = FakeLLMClient(responses)
-    with patch("app.services.agent.loop.get_llm_client", return_value=fake):
+    with (
+        patch("app.services.agent.loop.get_llm_client", return_value=fake),
+        patch("app.services.agent.loop.execute_tool", new=AsyncMock(return_value=_tool_call_result("get_financials"))),
+    ):
         result = asyncio.run(run_agent_loop("AAPL"))
 
-    assert fake.calls == 2  # 没有第三次调用，说明没有再次触发nudge
+    assert fake.calls == 3  # 没有第四次调用，说明没有再次触发nudge
     assert result.completed is True
     assert result.self_verification_triggered is False
 

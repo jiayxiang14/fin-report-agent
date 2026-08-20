@@ -1,26 +1,43 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { installMockEventSource, MockEventSource } from '../test/mockEventSource'
+import { installMockTaskStart } from '../test/mockTaskStart'
 import { useBestOfNAnalysis } from './useBestOfNAnalysis'
+
+// start() 现在是 async（先POST /best-of-n/start拿task_id，再订阅），所有
+// 调用都要用 `await act(async () => { await ... })`包一层
+async function startAnalysis(result, ticker) {
+  await act(async () => {
+    await result.current.start(ticker)
+  })
+}
 
 describe('useBestOfNAnalysis', () => {
   beforeEach(() => {
     installMockEventSource()
+    installMockTaskStart()
+    sessionStorage.clear()
   })
 
   afterEach(() => {
     MockEventSource.reset()
+    sessionStorage.clear()
   })
 
-  it('opens a connection to the best-of-n specific stream URL', () => {
+  it('POSTs /best-of-n/start (with a session_id header) then opens a connection to the task-id-based stream URL', async () => {
     const { result } = renderHook(() => useBestOfNAnalysis())
-    act(() => result.current.start('AMZN'))
-    expect(MockEventSource.latest().url).toBe('/api/analyze/AMZN/best-of-n/stream')
+    await startAnalysis(result, 'AMZN')
+
+    const [url, init] = global.fetch.mock.calls[0]
+    expect(url).toBe('/api/analyze/AMZN/best-of-n/start')
+    expect(init.method).toBe('POST')
+    expect(init.headers['X-Session-Id']).toEqual(expect.any(String))
+    expect(MockEventSource.latest().url).toBe('/api/analyze/best-of-n/stream/mock-task-1')
   })
 
-  it('maps trajectory_score/trajectory_reason from the candidate_scored event', () => {
+  it('maps trajectory_score/trajectory_reason from the candidate_scored event', async () => {
     const { result } = renderHook(() => useBestOfNAnalysis())
-    act(() => result.current.start('AMZN'))
+    await startAnalysis(result, 'AMZN')
     const source = MockEventSource.latest()
 
     act(() =>
@@ -43,9 +60,9 @@ describe('useBestOfNAnalysis', () => {
     })
   })
 
-  it('maps reflexion_triggered from the candidate_scored event', () => {
+  it('maps reflexion_triggered from the candidate_scored event', async () => {
     const { result } = renderHook(() => useBestOfNAnalysis())
-    act(() => result.current.start('AMZN'))
+    await startAnalysis(result, 'AMZN')
     const source = MockEventSource.latest()
 
     act(() =>
@@ -66,9 +83,9 @@ describe('useBestOfNAnalysis', () => {
     expect(result.current.candidates[0]).toMatchObject({ reflexionTriggered: true })
   })
 
-  it('appends a candidate_scored event to candidates without a report body yet', () => {
+  it('appends a candidate_scored event to candidates without a report body yet', async () => {
     const { result } = renderHook(() => useBestOfNAnalysis())
-    act(() => result.current.start('AMZN'))
+    await startAnalysis(result, 'AMZN')
     const source = MockEventSource.latest()
 
     act(() =>
@@ -91,9 +108,9 @@ describe('useBestOfNAnalysis', () => {
     })
   })
 
-  it('records a candidate_failed candidate with its error and no score, without dropping other candidates', () => {
+  it('records a candidate_failed candidate with its error and no score, without dropping other candidates', async () => {
     const { result } = renderHook(() => useBestOfNAnalysis())
-    act(() => result.current.start('AMZN'))
+    await startAnalysis(result, 'AMZN')
     const source = MockEventSource.latest()
 
     act(() =>
@@ -126,9 +143,9 @@ describe('useBestOfNAnalysis', () => {
     expect(result.current.candidates[0].totalScore).toBe(75.0)
   })
 
-  it('buckets reasoning/tool events per candidate_index so they do not mix across candidates', () => {
+  it('buckets reasoning/tool events per candidate_index so they do not mix across candidates', async () => {
     const { result } = renderHook(() => useBestOfNAnalysis())
-    act(() => result.current.start('AMZN'))
+    await startAnalysis(result, 'AMZN')
     const source = MockEventSource.latest()
 
     act(() => source.emit({ type: 'reasoning', candidate_index: 0, turn: 1, text: '候选0的思考' }))
@@ -152,9 +169,9 @@ describe('useBestOfNAnalysis', () => {
     expect(result.current.selectedLog[0].text).toBe('候选0的思考')
   })
 
-  it('backfills full report text and authoritative scores from the done event, overwriting the running-state candidates list', () => {
+  it('backfills full report text and authoritative scores from the done event, overwriting the running-state candidates list', async () => {
     const { result } = renderHook(() => useBestOfNAnalysis())
-    act(() => result.current.start('AMZN'))
+    await startAnalysis(result, 'AMZN')
     const source = MockEventSource.latest()
 
     act(() =>
@@ -200,9 +217,9 @@ describe('useBestOfNAnalysis', () => {
     expect(source.close).toHaveBeenCalledTimes(1)
   })
 
-  it('falls back to an empty selectedLog when the selected candidate never logged any events', () => {
+  it('falls back to an empty selectedLog when the selected candidate never logged any events', async () => {
     const { result } = renderHook(() => useBestOfNAnalysis())
-    act(() => result.current.start('AMZN'))
+    await startAnalysis(result, 'AMZN')
     const source = MockEventSource.latest()
 
     act(() =>
@@ -218,18 +235,35 @@ describe('useBestOfNAnalysis', () => {
     expect(result.current.selectedLog).toEqual([])
   })
 
-  it('resets candidates/selectedLog/result when start is called again', () => {
+  it('resets candidates/selectedLog/result when start is called again', async () => {
     const { result } = renderHook(() => useBestOfNAnalysis())
-    act(() => result.current.start('AMZN'))
+    await startAnalysis(result, 'AMZN')
     const firstSource = MockEventSource.latest()
     act(() => firstSource.emit({ type: 'candidate_scored', candidate_index: 0, temperature: 0.3, total_score: 80, rule_score: {}, llm_score: null, llm_reason: null }))
     expect(result.current.candidates).toHaveLength(1)
 
-    act(() => result.current.start('KO'))
+    await startAnalysis(result, 'KO')
 
     expect(firstSource.close).toHaveBeenCalledTimes(1)
     expect(result.current.candidates).toEqual([])
     expect(result.current.selectedLog).toEqual([])
     expect(result.current.result).toBeNull()
+  })
+
+  it('resume() reconnects to a previously saved task_id without calling /start again', () => {
+    sessionStorage.setItem(
+      'fin-report-agent:deep-task',
+      JSON.stringify({ ticker: 'AMZN', taskId: 'saved-deep-task', startedAt: 456 })
+    )
+    const { result } = renderHook(() => useBestOfNAnalysis())
+
+    let session
+    act(() => {
+      session = result.current.resume()
+    })
+
+    expect(session).toEqual({ ticker: 'AMZN', taskId: 'saved-deep-task', startedAt: 456 })
+    expect(global.fetch).not.toHaveBeenCalled()
+    expect(MockEventSource.latest().url).toBe('/api/analyze/best-of-n/stream/saved-deep-task')
   })
 })

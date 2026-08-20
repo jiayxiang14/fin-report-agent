@@ -17,6 +17,7 @@ import json
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import pandas as pd
@@ -25,6 +26,16 @@ from app.core.config import settings
 from app.services.cache_lock import get_lock
 
 CACHE_DIR = Path(__file__).resolve().parent.parent.parent / ".cache"
+# Polygon日线的t字段是"这个交易日美东零点"换算成UTC的毫秒时间戳（真实拉取过
+# AAPL数据验证：t=1786334400000对应UTC 04:00，正是2026-08-10这天美东零点在
+# 夏令时下的UTC表示），不是"UTC零点"——用datetime.fromtimestamp()不传时区
+# 会按服务器本地系统时区解释这个UTC时间戳，巧合情况下（服务器时区是UTC/
+# UTC+8/America/New_York本身）能凑出正确日期，但真实测过服务器时区是
+# America/Los_Angeles（西八区，一个对美股分析服务完全合理的部署选择）时，
+# 每一条日线的日期都会系统性地少算一天——04:00 UTC减7/8小时会跨到前一个
+# 自然日。美股交易日的定义本来就应该以美东时间为准，不该让"日线属于哪一天"
+# 这件事被服务器部署在哪个时区这种偶然因素决定
+_NY_TZ = ZoneInfo("America/New_York")
 # Polygon免费版是EOD数据，一天刷新一次足够——但20小时比一个自然日短，只要两次
 # 使用间隔略微超过20小时（哪怕只差一两小时），缓存就会判定过期，导致几乎每天
 # 第一次使用都触发"板块轮动12个ETF+主题轮动27个ticker，共35+个标的一起过期，
@@ -114,7 +125,7 @@ async def fetch_daily_bars(ticker: str, client: httpx.AsyncClient) -> pd.DataFra
         if not results:
             raise PolygonClientError(f"Polygon 返回了 {ticker} 的空行情数据")
 
-        dates = [datetime.fromtimestamp(r["t"] / 1000).date().isoformat() for r in results]
+        dates = [datetime.fromtimestamp(r["t"] / 1000, tz=_NY_TZ).date().isoformat() for r in results]
         closes = [r["c"] for r in results]
         highs = [r["h"] for r in results]
         lows = [r["l"] for r in results]

@@ -263,8 +263,42 @@ export default function ReportPanel({ result }) {
                   真实发生的事，不是Prompt里写了就默认相信——用户应该能看到
                   这次分析实际经过了哪些自我把关步骤，而不是无从验证。
                   reflexion_triggered只在深度分析里可能为true（普通分析
-                  没有这道检查），false时不展示，避免暗示"本该触发但没触发"。 */}
+                  没有这道检查），false时不展示，避免暗示"本该触发但没触发"。
+
+                  *_gate_triggered只代表"发现问题、插过nudge"这个历史事实，
+                  不代表模型真的照做了——之前5个badge统一用绿色+肯定语气的
+                  文案，曾经出过真实bug：gate拦下来要求模型重新输出，模型只
+                  回一句不带标签的收尾话，代码兜底机制会原样捞回没解决问题的
+                  旧草稿，triggered=true但问题其实还在，徽章却在说"已解决"。
+                  现在按*_resolved（拿最终结果重新核对一遍算出来的客观结论）
+                  区分两种颜色/文案，resolved=false时改成琥珀色警示，如实
+                  告诉用户"发现了问题，但没能确认修好"——这比沉默不提更有
+                  价值，不是要藏起来的坏消息。 */}
               <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-400">
+                {result.structure_gate_triggered &&
+                  (result.structure_gate_resolved ? (
+                    <span className="flex items-center gap-1">
+                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+                      结构缺失后已补全
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1 text-amber-600">
+                      <AlertTriangle className="h-3.5 w-3.5" />
+                      检测到结构缺失，未能确认已补全
+                    </span>
+                  ))}
+                {result.tool_coverage_gate_triggered &&
+                  (result.tool_coverage_gate_resolved ? (
+                    <span className="flex items-center gap-1">
+                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+                      补查基础数据后已定稿
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1 text-amber-600">
+                      <AlertTriangle className="h-3.5 w-3.5" />
+                      检测到未查基础数据，未能确认已补查
+                    </span>
+                  ))}
                 <span className="flex items-center gap-1">
                   {result.self_verification_triggered ? (
                     <>
@@ -275,6 +309,42 @@ export default function ReportPanel({ result }) {
                     '本次未做自我核查'
                   )}
                 </span>
+                {result.verification_mismatch_triggered &&
+                  (result.verification_mismatch_resolved ? (
+                    <span className="flex items-center gap-1">
+                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+                      核查发现数字不一致后已修正
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1 text-amber-600">
+                      <AlertTriangle className="h-3.5 w-3.5" />
+                      核查发现数字不一致，未能确认已修正
+                    </span>
+                  ))}
+                {result.traceability_gate_triggered &&
+                  (result.traceability_gate_resolved ? (
+                    <span className="flex items-center gap-1">
+                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+                      数字可追溯率偏低已要求补充说明
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1 text-amber-600">
+                      <AlertTriangle className="h-3.5 w-3.5" />
+                      数字可追溯率偏低，要求补充说明后仍未改善
+                    </span>
+                  ))}
+                {result.sentiment_consistency_gate_triggered &&
+                  (result.sentiment_consistency_gate_resolved ? (
+                    <span className="flex items-center gap-1">
+                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+                      情绪判断与市场反应有落差已要求说明
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1 text-amber-600">
+                      <AlertTriangle className="h-3.5 w-3.5" />
+                      情绪判断与市场反应有落差，要求说明后仍未处理
+                    </span>
+                  ))}
                 {result.reflexion_triggered && (
                   <span className="flex items-center gap-1">
                     <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />

@@ -154,6 +154,154 @@ describe('ReportPanel', () => {
     expect(screen.getByText('本次未做自我核查')).toBeInTheDocument()
   })
 
+  it('shows the verification-mismatch badge only when it was actually triggered', () => {
+    const { rerender } = render(
+      <ReportPanel
+        result={{
+          ...resultWith('结论', 'neutral'),
+          verification_mismatch_triggered: true,
+          verification_mismatch_resolved: true,
+        }}
+      />
+    )
+    expect(screen.getByText('核查发现数字不一致后已修正')).toBeInTheDocument()
+
+    rerender(
+      <ReportPanel result={{ ...resultWith('结论', 'neutral'), verification_mismatch_triggered: false }} />
+    )
+    expect(screen.queryByText('核查发现数字不一致后已修正')).not.toBeInTheDocument()
+  })
+
+  it('shows an amber warning instead when verification-mismatch triggered but was never confirmed resolved', () => {
+    render(
+      <ReportPanel
+        result={{
+          ...resultWith('结论', 'neutral'),
+          verification_mismatch_triggered: true,
+          verification_mismatch_resolved: false,
+        }}
+      />
+    )
+    expect(screen.getByText('核查发现数字不一致，未能确认已修正')).toBeInTheDocument()
+    expect(screen.queryByText('核查发现数字不一致后已修正')).not.toBeInTheDocument()
+  })
+
+  it('shows the structure-gate badge only when it was actually triggered', () => {
+    const { rerender } = render(
+      <ReportPanel
+        result={{ ...resultWith('结论', 'neutral'), structure_gate_triggered: true, structure_gate_resolved: true }}
+      />
+    )
+    expect(screen.getByText('结构缺失后已补全')).toBeInTheDocument()
+
+    rerender(<ReportPanel result={{ ...resultWith('结论', 'neutral'), structure_gate_triggered: false }} />)
+    expect(screen.queryByText('结构缺失后已补全')).not.toBeInTheDocument()
+  })
+
+  it('shows an amber warning instead when structure gate triggered but was never confirmed resolved', () => {
+    render(
+      <ReportPanel
+        result={{ ...resultWith('结论', 'neutral'), structure_gate_triggered: true, structure_gate_resolved: false }}
+      />
+    )
+    expect(screen.getByText('检测到结构缺失，未能确认已补全')).toBeInTheDocument()
+    expect(screen.queryByText('结构缺失后已补全')).not.toBeInTheDocument()
+  })
+
+  it('shows the tool-coverage-gate badge only when it was actually triggered', () => {
+    const { rerender } = render(
+      <ReportPanel
+        result={{
+          ...resultWith('结论', 'neutral'),
+          tool_coverage_gate_triggered: true,
+          tool_coverage_gate_resolved: true,
+        }}
+      />
+    )
+    expect(screen.getByText('补查基础数据后已定稿')).toBeInTheDocument()
+
+    rerender(<ReportPanel result={{ ...resultWith('结论', 'neutral'), tool_coverage_gate_triggered: false }} />)
+    expect(screen.queryByText('补查基础数据后已定稿')).not.toBeInTheDocument()
+  })
+
+  it('shows an amber warning instead when tool-coverage gate triggered but was never confirmed resolved', () => {
+    render(
+      <ReportPanel
+        result={{
+          ...resultWith('结论', 'neutral'),
+          tool_coverage_gate_triggered: true,
+          tool_coverage_gate_resolved: false,
+        }}
+      />
+    )
+    expect(screen.getByText('检测到未查基础数据，未能确认已补查')).toBeInTheDocument()
+    expect(screen.queryByText('补查基础数据后已定稿')).not.toBeInTheDocument()
+  })
+
+  it('shows the sentiment-consistency-gate badge only when it was actually triggered', () => {
+    const { rerender } = render(
+      <ReportPanel
+        result={{
+          ...resultWith('结论', 'neutral'),
+          sentiment_consistency_gate_triggered: true,
+          sentiment_consistency_gate_resolved: true,
+        }}
+      />
+    )
+    expect(screen.getByText('情绪判断与市场反应有落差已要求说明')).toBeInTheDocument()
+
+    rerender(
+      <ReportPanel result={{ ...resultWith('结论', 'neutral'), sentiment_consistency_gate_triggered: false }} />
+    )
+    expect(screen.queryByText('情绪判断与市场反应有落差已要求说明')).not.toBeInTheDocument()
+  })
+
+  it('shows an amber warning instead when sentiment-consistency gate triggered but was never confirmed resolved', () => {
+    render(
+      <ReportPanel
+        result={{
+          ...resultWith('结论', 'neutral'),
+          sentiment_consistency_gate_triggered: true,
+          sentiment_consistency_gate_resolved: false,
+        }}
+      />
+    )
+    expect(screen.getByText('情绪判断与市场反应有落差，要求说明后仍未处理')).toBeInTheDocument()
+    expect(screen.queryByText('情绪判断与市场反应有落差已要求说明')).not.toBeInTheDocument()
+  })
+
+  it('shows the traceability-gate badge only when it was actually triggered', () => {
+    const { rerender } = render(
+      <ReportPanel
+        result={{
+          ...resultWith('结论', 'neutral'),
+          traceability_gate_triggered: true,
+          traceability_gate_resolved: true,
+        }}
+      />
+    )
+    expect(screen.getByText('数字可追溯率偏低已要求补充说明')).toBeInTheDocument()
+
+    rerender(
+      <ReportPanel result={{ ...resultWith('结论', 'neutral'), traceability_gate_triggered: false }} />
+    )
+    expect(screen.queryByText('数字可追溯率偏低已要求补充说明')).not.toBeInTheDocument()
+  })
+
+  it('shows an amber warning instead when traceability gate triggered but was never confirmed resolved', () => {
+    render(
+      <ReportPanel
+        result={{
+          ...resultWith('结论', 'neutral'),
+          traceability_gate_triggered: true,
+          traceability_gate_resolved: false,
+        }}
+      />
+    )
+    expect(screen.getByText('数字可追溯率偏低，要求补充说明后仍未改善')).toBeInTheDocument()
+    expect(screen.queryByText('数字可追溯率偏低已要求补充说明')).not.toBeInTheDocument()
+  })
+
   it('shows the reflexion badge only when it was actually triggered', () => {
     const { rerender } = render(
       <ReportPanel result={{ ...resultWith('结论', 'neutral'), reflexion_triggered: true }} />
