@@ -66,4 +66,19 @@ describe('parseReport', () => {
     const raw = '<evidence>第一段</evidence>无关文字<evidence>第二段</evidence>'
     expect(parseReport(raw).sections.evidence).toBe('第一段')
   })
+
+  it('recovers section content when the model forgot to close a tag (real ~0.1% occurrence)', () => {
+    // 严格匹配<tag>...</tag>会因为缺失的</conclusion>让整块内容消失——
+    // 兜底应该退化成匹配到下一个已知标签开始为止
+    const raw = '<conclusion>买入<evidence>e</evidence><flags>f</flags>'
+    const result = parseReport(raw)
+    expect(result.sections.conclusion).toBe('买入')
+    expect(result.sections.evidence).toBe('e')
+    expect(result.sections.flags).toBe('f')
+  })
+
+  it('lenient fallback for the last tag stops at end of string when nothing follows', () => {
+    const raw = '<conclusion>c</conclusion><evidence>e</evidence><flags>没有闭合标签的最后一段'
+    expect(parseReport(raw).sections.flags).toBe('没有闭合标签的最后一段')
+  })
 })

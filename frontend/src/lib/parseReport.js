@@ -10,6 +10,7 @@
 // sections.sentiment 就是 undefined，前端会退化成中性配色。
 
 const TAG_ORDER = ['conclusion', 'evidence', 'flags', 'sentiment']
+const TAG_ALTERNATION = TAG_ORDER.join('|')
 
 export function parseReport(rawText) {
   if (!rawText) {
@@ -19,7 +20,12 @@ export function parseReport(rawText) {
   const sections = {}
   let hasAnyTag = false
   for (const tag of TAG_ORDER) {
-    const match = rawText.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`))
+    let match = rawText.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`))
+    if (!match) {
+      // 兜底：模型偶尔漏写闭合标签（实测约0.1%概率），严格匹配会让整块内容
+      // 消失——退化成匹配到下一个已知标签开始或文本结尾为止
+      match = rawText.match(new RegExp(`<${tag}>([\\s\\S]*?)(?=<(?:${TAG_ALTERNATION})>|$)`))
+    }
     if (match) {
       sections[tag] = match[1].trim()
       hasAnyTag = true

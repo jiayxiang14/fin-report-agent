@@ -1,7 +1,6 @@
-import { Search, Sparkles } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { Loader2, Search, Sparkles } from 'lucide-react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import AgentReasoningPanel from './components/AgentReasoningPanel'
-import CandidateComparisonPanel from './components/CandidateComparisonPanel'
 import CompanyProfilePanel from './components/CompanyProfilePanel'
 import FinancialsHistoryPanel from './components/FinancialsHistoryPanel'
 import FinancialsPanel from './components/FinancialsPanel'
@@ -11,6 +10,13 @@ import SectorPanel from './components/SectorPanel'
 import ThematicFlowPanel from './components/ThematicFlowPanel'
 import { useAgentAnalysis } from './hooks/useAgentAnalysis'
 import { useBestOfNAnalysis } from './hooks/useBestOfNAnalysis'
+
+// 懒加载：这个面板只有点了"深度分析"才会用到，普通分析的用户永远用不上——
+// 不像其它面板（FinancialsPanel/SectorPanel等）那样一提交ticker就必须同步
+// 展示（CLAUDE.md的架构原则："同步展示结构化数据"），这个面板本来就是异步
+// 出现在深度分析流程后段的，用React.lazy延迟到真正需要时才下载对应代码，
+// 缩小首屏必须加载的bundle体积，不影响任何一个面板"该同步出现"的时机。
+const CandidateComparisonPanel = lazy(() => import('./components/CandidateComparisonPanel'))
 
 const BEST_OF_N_CANDIDATE_COUNT = 3
 
@@ -175,13 +181,22 @@ function App() {
             <ThematicFlowPanel ticker={submittedTicker} />
 
             {isDeep && (
-              <CandidateComparisonPanel
-                candidates={bestOfN.candidates}
-                totalCount={BEST_OF_N_CANDIDATE_COUNT}
-                result={bestOfN.result}
-                done={bestOfN.done}
-                streamError={bestOfN.streamError}
-              />
+              <Suspense
+                fallback={
+                  <div className="flex items-center gap-2 rounded-xl border border-gray-200 bg-white p-4 text-xs text-gray-400 shadow-sm">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    候选对比面板加载中…
+                  </div>
+                }
+              >
+                <CandidateComparisonPanel
+                  candidates={bestOfN.candidates}
+                  totalCount={BEST_OF_N_CANDIDATE_COUNT}
+                  result={bestOfN.result}
+                  done={bestOfN.done}
+                  streamError={bestOfN.streamError}
+                />
+              </Suspense>
             )}
 
             <div className="grid grid-cols-1 gap-4 md:grid-cols-[1fr_2fr]">

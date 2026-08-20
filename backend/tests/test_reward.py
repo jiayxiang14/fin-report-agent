@@ -138,6 +138,27 @@ def test_structure_zero_when_no_final_report():
     assert score.structure == 0.0
 
 
+def test_structure_full_marks_when_a_tag_is_missing_its_closing_tag():
+    """模型偶尔漏写闭合标签（真实历史数据里实测约0.1%概率，比如写了<conclusion>
+    却直接开始<evidence>而没有</conclusion>）——不该让整块内容被判定为"不存在"，
+    退化成匹配到下一个已知标签为止。"""
+    report = "<conclusion>a<evidence>b</evidence><flags>c</flags>"
+    score = reward.score_rule_based(_make_run_result(report), [])
+    assert score.structure == reward.STRUCTURE_MAX
+
+
+def test_structure_recovers_content_even_when_two_consecutive_tags_are_unclosed():
+    report = "<conclusion>a<evidence>b<flags>c</flags>"
+    score = reward.score_rule_based(_make_run_result(report), [])
+    assert score.structure == reward.STRUCTURE_MAX
+
+
+def test_extract_tag_lenient_fallback_stops_at_sentiment_boundary():
+    # flags漏关闭合标签时，兜底匹配不该把之后的<sentiment>内容也吞进去
+    report = "<conclusion>a</conclusion><evidence>b</evidence><flags>c<sentiment>positive</sentiment>"
+    assert reward._extract_tag(report, "flags") == "c"
+
+
 def test_length_full_marks_within_reasonable_band():
     report = "<conclusion>a</conclusion><evidence>" + "b" * 400 + "</evidence><flags>c</flags>"
     score = reward.score_rule_based(_make_run_result(report), [])
@@ -211,7 +232,7 @@ def test_llm_judge_averages_scores_across_self_consistency_samples():
     """轻量自我一致性：裁判现在对同一个prompt并发采样JUDGE_SAMPLE_COUNT次取平均，
     不是只发一次请求。这里用一个调用计数器让每次返回不同的分数，验证最终结果
     确实是平均值，不是随便挑了某一次的结果。"""
-    scores_by_call = iter([6, 8, 10])
+    scores_by_call = iter([6, 7, 8, 9, 10])
 
     class FakeLLM:
         async def create_message(self, system, messages, tools, temperature=None):
@@ -223,8 +244,8 @@ def test_llm_judge_averages_scores_across_self_consistency_samples():
     with patch("app.services.agent.reward.get_llm_client", return_value=FakeLLM()):
         score, reason = asyncio.run(reward.score_llm_judge("<conclusion>a</conclusion>"))
 
-    assert reward.JUDGE_SAMPLE_COUNT == 3  # 断言依赖的采样次数没有被悄悄改掉
-    assert score == 80.0  # (60+80+100)/3
+    assert reward.JUDGE_SAMPLE_COUNT == 5  # 断言依赖的采样次数没有被悄悄改掉
+    assert score == 80.0  # (60+70+80+90+100)/5
     assert reason is not None
 
 
@@ -272,11 +293,40 @@ def test_llm_judge_ensemble_samples_use_nonzero_temperature():
 def test_judge_prompt_requires_reasoning_before_score():
     """G-Eval式"先推理后打分"：分数标签必须出现在理由标签之后，这样分数
     才是以模型自己刚写出的推理为条件生成的，不是先斩后奏的场面话。"""
-    rendered = reward._JUDGE_PROMPT_TEMPLATE.format(report="x")
+    rendered = reward._JUDGE_PROMPT_TEMPLATE.format(report="x", anchors="")
     assert rendered.index("<reason>") < rendered.index("<score>")
 
     rendered_trajectory = reward._TRAJECTORY_JUDGE_PROMPT_TEMPLATE.format(trajectory="x")
     assert rendered_trajectory.index("<reason>") < rendered_trajectory.index("<score>")
+
+
+def test_judge_score_anchors_are_sourced_from_the_human_labeled_eval_set():
+    """锚点必须来自tests/fixtures/report_quality_eval_set.json里真实的人工标注
+    结果（role=="anchor"的3条），不能是编造的/LLM生成的"示例"——那样起不到校准
+    作用，等同于自己骗自己。这里核对锚点常量里的3段摘录，都能在标注文件里
+    role=="anchor"的条目中找到对应的<conclusion>原文，防止手抄摘录时打字错误
+    或者以后偷偷替换成非人工标注的内容而不被发现。"""
+    import json
+    import re
+    from pathlib import Path
+
+    eval_set_path = (
+        Path(__file__).resolve().parent / "fixtures" / "report_quality_eval_set.json"
+    )
+    data = json.loads(eval_set_path.read_text())
+    anchor_items = [item for item in data["items"] if item["role"] == "anchor"]
+
+    assert len(anchor_items) == 3
+    for item in anchor_items:
+        match = re.search(r"<conclusion>([\s\S]*?)</conclusion>", item["final_report"])
+        assert match is not None
+        conclusion_text = match.group(1).strip()
+        assert conclusion_text in reward._JUDGE_SCORE_ANCHORS
+
+
+def test_judge_score_anchors_are_included_in_the_rendered_prompt():
+    rendered = reward._JUDGE_PROMPT_TEMPLATE.format(report="x", anchors=reward._JUDGE_SCORE_ANCHORS)
+    assert "参考示例" in rendered
 
 
 def test_judge_uses_settings_judge_provider_when_configured(monkeypatch):

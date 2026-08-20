@@ -42,14 +42,26 @@ TRAJECTORY_JUDGE_WEIGHT = 0.25
 
 # 每个裁判独立采样几次取平均（轻量自我一致性），缓解单次采样抽到极端分数的方差。
 # 必须配非零温度——0.0温度下重复采样会得到几乎相同的单点结果，自我一致性就没有
-# 意义了。3次是"能看出方差"和"不把裁判这一步的调用量炸到不成比例"之间的折中，
-# 裁判prompt本身很短（不带工具、不带财报全文），3倍调用量相对Agent Loop主体的
-# 开销依然是零头
-JUDGE_SAMPLE_COUNT = 3
+# 意义了。原本是3次，ground truth校准诊断时实测发现3次的均值run-to-run方差
+# 能到1分左右（跟被拿来分析的"裁判-人工分歧"同一个量级，噪音和信号分不清），
+# 改成5次把标准误差压到约77%（成本+67%）——不是精确计算出来的最优值，是"明显
+# 改善但不把调用量炸到不成比例"之间的折中，裁判prompt本身很短（不带工具、
+# 不带财报全文），5倍调用量相对Agent Loop主体的开销依然是零头
+JUDGE_SAMPLE_COUNT = 5
 JUDGE_SAMPLE_TEMPERATURE = 0.7
 
-_TAG_PATTERNS = {
-    tag: re.compile(rf"<{tag}>([\s\S]*?)</{tag}>") for tag in ("conclusion", "evidence", "flags")
+_STRUCTURE_TAGS = ("conclusion", "evidence", "flags")
+_KNOWN_REPORT_TAGS = (*_STRUCTURE_TAGS, "sentiment")
+
+_TAG_PATTERNS = {tag: re.compile(rf"<{tag}>([\s\S]*?)</{tag}>") for tag in _STRUCTURE_TAGS}
+
+# 兜底：模型偶尔会漏写闭合标签（实测约0.1%概率，比如写了<conclusion>却直接
+# 开始<evidence>而没有</conclusion>）。严格正则在这种情况下完全匹配不到，
+# 会让整块内容被判定为"不存在"——前端parseReport.js同款问题也同样兜底了。
+# 退化成匹配到下一个已知标签开始或文本结尾为止，不因为一个漏掉的闭合标签
+# 丢失一整块本该展示的内容。
+_LENIENT_TAG_PATTERNS = {
+    tag: re.compile(rf"<{tag}>([\s\S]*?)(?=<(?:{'|'.join(_KNOWN_REPORT_TAGS)})>|$)") for tag in _STRUCTURE_TAGS
 }
 
 # 理由标签放在分数标签之前：裁判模型是自回归生成的，如果先输出<score>，理由只是
@@ -57,13 +69,35 @@ _TAG_PATTERNS = {
 # 写出的推理为条件生成（G-Eval的核心思路），比"先斩后奏"式的评分更可信
 _JUDGE_PROMPT_TEMPLATE = """你是一个投研简报质量评审员。请阅读下面这份AI生成的投研简报，
 按"逻辑连贯性、有没有自相矛盾、洞察是否有价值"这几个维度打一个1到10的整数分。
-
+{anchors}
 先写出你的推理过程，再给出分数。只按下面的格式回复，不要有其他任何文字：
 <reason>一句话说明理由</reason>
 <score>分数</score>
 
 简报内容：
 {report}
+"""
+
+# few-shot锚点：从tests/fixtures/report_quality_eval_set.json人工标注结果里
+# 选出的低/中/高三档代表样例（role=="anchor"的3条），只摘录<conclusion>——
+# 摘全文会让每次裁判调用的prompt长度明显增加，<conclusion>是最能体现"好在
+# 哪/差在哪"的自包含片段。分数是2026-08-21人工标注的真实结果，不是编造的
+# 参照——若报告的XML结构或投研简报的常见叙事方式发生较大变化，这三条锚点
+# 需要跟着重新挑选，不能无限期沿用。
+_JUDGE_SCORE_ANCHORS = """
+参考示例（人工标注，帮助你校准打分尺度）：
+
+- 示例A（人工评分5分）：
+  "Apple 当前处于"强业绩、弱预期"的典型背离格局。Q3 FY2026 营收同比+16%、净利润同比+27%，产品毛利率大幅跃升，基本面数据无可挑剔。但管理层在 MD&A 中密集释放前瞻性警告——组件成本飙升、毛利率承压、AI 投入推高费用、监管逆风加剧——这些信号叠加板块动量走弱的背景，导致财报发布后股价暴跌 7.35%。短期来看，市场正在对"利润率高点已过"的叙事定价；中长期则取决于 AI 投入能否转化为新一轮产品周期，以及反垄断/关税风险的演变方向。"
+  中低分理由：核心叙事有价值，但正文有大量断裂、错位、疑似拼接错误的文本，部分数字表述前后不一致、因果关系交代不清，严重影响证据链可读性和可信度。
+
+- 示例B（人工评分7分）：
+  "Alphabet主营业务增长强劲且加速——Q2营收同比增长24%、经营利润增长30%，Google Cloud同比暴增82%——但Q2 headline净利润（$1121.93亿，同比+298%）几乎完全由SpaceX及一家私有公司的未实现投资账面收益驱动，与主营经营质量无关。公司同期完成近$500亿股权融资用于AI基建扩张，叠加暂停回购和多重反垄断风险，市场在财报发布后以-7.13%的跌幅表达了对其非经常性利润泡沫和潜在稀释压力的清醒认知。"
+  中分理由："不要被账面净利润暴增骗了，要看经营利润"这个切入点很好，把关键矛盾抓得准；但关键数字和融资结构表述存在可疑/混乱之处，核心数据口径问题是投研报告里比较严重的扣分项，不给更高分。
+
+- 示例C（人工评分9分）：
+  "SNDK正处于AI驱动的NAND闪存超级周期中：最新季度净利润36.15亿美元、九个月经营现金流45.5亿美元、已提前偿清全部债务，实现了从FY2025巨亏到暴利的剧烈反转，管理层明确表示有利的定价环境预计持续到2026日历年及以后。但需清醒看到，营收爆发几乎全部来自闪存涨价（每GB均价+248%、出货量零增长），且最新一季业绩虽超预期16.6%、股价反而下跌6.8%，存储主题相对强弱也已转弱——基本面强劲，但周期性回落风险与市场分歧是当前最主要的观察点。"
+  高分理由：因果链完整，把"营收暴增几乎全部来自涨价而非需求量"这个关键区分点讲清楚，并用真实现金流数据证明利润有现金支撑而非纯会计利润，兼顾了机会和风险两面。
 """
 
 _TRAJECTORY_JUDGE_PROMPT_TEMPLATE = """你是一个投研Agent的决策过程评审员。下面不是最终简报，
@@ -88,7 +122,10 @@ _REASON_TAG_PATTERN = re.compile(r"<reason>([\s\S]*?)</reason>")
 
 def _extract_tag(text: str, tag: str) -> str | None:
     match = _TAG_PATTERNS[tag].search(text)
-    return match.group(1).strip() if match else None
+    if match:
+        return match.group(1).strip()
+    lenient_match = _LENIENT_TAG_PATTERNS[tag].search(text)
+    return lenient_match.group(1).strip() if lenient_match else None
 
 
 def _score_traceability(report_text: str, raw_tool_outputs: list[str]) -> tuple[float, int, int]:
@@ -213,7 +250,8 @@ async def score_llm_judge(final_report: str | None) -> tuple[float | None, str |
     """
     if not final_report:
         return None, None
-    return await _call_judge_ensemble(_JUDGE_PROMPT_TEMPLATE.format(report=final_report))
+    prompt = _JUDGE_PROMPT_TEMPLATE.format(report=final_report, anchors=_JUDGE_SCORE_ANCHORS)
+    return await _call_judge_ensemble(prompt)
 
 
 async def score_trajectory_judge(
