@@ -62,6 +62,147 @@ project deliberately separates the two:
 The final report is emitted as `<conclusion>/<evidence>/<flags>` XML, which
 the frontend renders as three distinct sections.
 
+## Architecture
+
+### Layered backend
+
+```mermaid
+flowchart TD
+    subgraph Client["Frontend — React"]
+        UI["Panels: Financials, Sector, Company Profile,<br/>Peer, Thematic Flow, Report, Reasoning trace"]
+        Hooks["useAgentAnalysis / useBestOfNAnalysis<br/>(SSE-consuming state machines)"]
+    end
+
+    subgraph API["API layer — FastAPI routers"]
+        Sync["Sync data routes<br/>/api/financials, /api/financials-history,<br/>/api/sector-position, /api/company-profile,<br/>/api/peer-comparison, /api/thematic-flow,<br/>/api/filing-text"]
+        Async["Async agent routes<br/>/api/analyze/{ticker}/start (+ /best-of-n/start)<br/>/api/analyze/stream/{task_id} (SSE)"]
+        Guard["rate_limit + session_guard + ticker_path<br/>(throttling, single-in-flight guard, input validation)"]
+    end
+
+    subgraph Service["Service layer"]
+        Data["sec_edgar / polygon_client / alpha_vantage_client<br/>sector_rotation + rrg / company_profile /<br/>peer_comparison / price_reaction / earnings_surprise /<br/>thematic_flow / filing_text"]
+        CacheLock["cache_lock — file-lock guarded disk cache<br/>shared by the data services above"]
+    end
+
+    subgraph Agent["Agent subsystem — services/agent/"]
+        Loop["loop.py — the Agent Loop"]
+        LLMClient["llm_client.py — provider adapter<br/>(DeepSeek / Claude, same interface)"]
+        Tools["tools.py — 8 tool schemas + dispatch"]
+        Prompt["system_prompt.py — retrieval / analysis /<br/>generation, concatenated at runtime"]
+        Trace["task_registry + trace_log —<br/>background task, SSE replay buffer,<br/>per-run structured log"]
+        BON["best_of_n.py + reward.py —<br/>N candidates, rule + LLM-judge scoring"]
+    end
+
+    subgraph External["External services"]
+        SEC["SEC EDGAR<br/>data.sec.gov"]
+        Market["Polygon.io / Alpha Vantage"]
+        LLM["DeepSeek / Claude<br/>(Anthropic Messages API)"]
+    end
+
+    UI --> Hooks --> Sync
+    Hooks --> Async
+    Sync --> Guard
+    Async --> Guard
+    Sync --> Data
+    Async --> Trace --> Loop
+    Loop --> Tools --> Data
+    Loop --> LLMClient --> LLM
+    Loop --> Prompt
+    BON --> Loop
+    Data --> CacheLock
+    Data --> SEC
+    Data --> Market
+```
+
+### Agent Loop
+
+The core `while` loop in `loop.py` — the model drives every branch; the code
+only enforces the turn budget and the deterministic gate checks.
+
+```mermaid
+flowchart TD
+    Start(["run_agent_loop(ticker)"]) --> Call["LLM.create_message(system, messages, tools, temperature)"]
+    Call --> Record["record reasoning_note, emit 'reasoning' event"]
+    Record --> Decide{"stop_reason?"}
+
+    Decide -- "tool_use" --> Parallel["asyncio.gather: run every tool_use<br/>call from this turn in parallel"]
+    Parallel --> EmitTool["emit tool_call_started / tool_call_finished"]
+    EmitTool --> Compact["compact old, already-seen large tool<br/>results into placeholders<br/>(structured-data tools exempt)"]
+    Compact --> Append["append tool_results, next turn"]
+    Append --> Budget{"turn < max_turns?"}
+    Budget -- yes --> Call
+    Budget -- no --> MaxTurns["return completed=false<br/>stop_reason=max_turns_exceeded"]
+
+    Decide -- "end_turn, has &lt;conclusion&gt;,<br/>not yet gate-checked" --> Gates["batch-check 6 gates: self-verification /<br/>structure / tool coverage / verification<br/>mismatch / traceability / sentiment consistency"]
+    Gates --> GateIssues{"any issues?"}
+    GateIssues -- yes --> Nudge["inject one combined nudge<br/>(all issues at once)"]
+    Nudge --> Call
+    GateIssues -- no --> ReflexionCheck
+
+    Decide -- "end_turn, already nudged,<br/>reply has no tags" --> FormatNudge["inject 'must re-emit the full<br/>tagged report' nudge (once)"]
+    FormatNudge --> Call
+
+    ReflexionCheck{"reflexion_check given?<br/>(Best-of-N only)"}
+    ReflexionCheck -- "yes, critique returned" --> ReflexNudge["inject critique, ask to redo (once)"]
+    ReflexNudge --> Call
+    ReflexionCheck -- "no / already checked" --> Finalize["resolve final_report<br/>(fall back to last tagged reasoning<br/>note if this turn's text has none)"]
+    Finalize --> Return["return AgentRunResult<br/>completed = (stop_reason == end_turn)"]
+
+    Decide -- "refusal / max_tokens" --> Return
+```
+
+### Request sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant FE as Frontend
+    participant API as FastAPI (sync routes)
+    participant Reg as task_registry (SSE)
+    participant AL as Agent Loop
+    participant LLM as DeepSeek / Claude
+    participant Tools as Tools (SEC EDGAR / Polygon / Alpha Vantage)
+
+    User->>FE: enter ticker, click "Analyze"
+    par structured data — shown immediately
+        FE->>API: GET /api/financials/{ticker}
+        FE->>API: GET /api/sector-position/{ticker}
+        FE->>API: GET /api/company-profile/{ticker}
+        FE->>API: GET /api/peer-comparison/{ticker}
+    end
+    API-->>FE: financials, sector position, profile, peers
+
+    FE->>Reg: POST /api/analyze/{ticker}/start
+    Reg-->>FE: { task_id }
+    Reg->>AL: run_agent_loop(ticker) — background task
+    FE->>Reg: GET /api/analyze/stream/{task_id} (SSE: replay buffer, then live)
+
+    loop until end_turn or max_turns
+        AL->>LLM: create_message(system, messages, tools)
+        LLM-->>AL: text + tool_use[] (stop_reason)
+        Reg-->>FE: SSE "reasoning"
+        par same-turn tool calls, run in parallel
+            AL->>Tools: execute_tool(name, input)
+            Tools-->>AL: result (disk-cached where applicable)
+        end
+        Reg-->>FE: SSE "tool_call_started" / "tool_call_finished"
+        AL->>AL: compact old large tool results,<br/>append new tool_results
+    end
+    AL->>AL: batch gate checks, nudge + retry once<br/>if self-check / structure / traceability fail
+    AL-->>Reg: AgentRunResult (final_report, transcript, gate flags)
+    Reg-->>FE: SSE "done"
+    FE-->>User: render ReportPanel (conclusion/evidence/flags)<br/>+ AgentReasoningPanel (full trace)
+
+    opt user clicks "Deep analysis"
+        FE->>Reg: POST /api/analyze/{ticker}/best-of-n/start
+        Reg->>AL: run_agent_loop × 3 in parallel (temperature 0.3 / 0.6 / 1.0)
+        AL-->>Reg: 3 candidates, scored (rule-based + LLM judge)
+        Reg-->>FE: SSE "done" — selected candidate + all scores
+        FE-->>User: render CandidateComparisonPanel
+    end
+```
+
 ## Project structure
 
 ```
