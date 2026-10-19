@@ -51,3 +51,13 @@ def release_in_flight_request(session_id: str | None) -> None:
     周期走，不是跟着这次HTTP请求/响应的生命周期走。"""
     if session_id is not None:
         _in_flight_sessions.discard(session_id)
+
+
+def acquire_in_flight_request(session_id: str | None) -> bool:
+    """不经过HTTP请求的占锁入口：进程重启后自动恢复的任务没有对应的请求，
+    但"这个session有一个分析正在进行"这件事依然成立，要重新占住。返回False
+    表示这个session已经有别的分析在跑（恢复照常进行，只是不重复占锁）。"""
+    if session_id is None or session_id in _in_flight_sessions:
+        return False
+    _in_flight_sessions.add(session_id)
+    return True

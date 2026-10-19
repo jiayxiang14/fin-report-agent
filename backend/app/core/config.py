@@ -25,5 +25,15 @@ class Settings(BaseSettings):
     # 评自己生成的内容"这种自评偏好嫌疑——需要对应供应商的 API Key 已配置
     judge_llm_provider: str = ""
 
+    # 后台定期预热板块ETF/主题篮子行情缓存（见cache_warmer.py），避免缓存
+    # 超过30小时TTL全部过期后，第一个真实用户请求撞上Polygon限速器排队逐个
+    # 刷新、拖到几分钟的冷启动体验。默认开启，不想让本地/CI环境后台悄悄发
+    # 真实网络请求时可以关掉
+    enable_cache_warming: bool = True
+
+    # 启动时自动接回"跑到一半被打断"的普通分析（见task_recovery.py）。默认
+    # 开启；测试/CI里不经过lifespan，不受影响
+    enable_task_recovery: bool = True
+
 
 settings = Settings()

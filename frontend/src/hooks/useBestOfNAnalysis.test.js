@@ -1,5 +1,5 @@
 import { act, renderHook } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { installMockEventSource, MockEventSource } from '../test/mockEventSource'
 import { installMockTaskStart } from '../test/mockTaskStart'
 import { useBestOfNAnalysis } from './useBestOfNAnalysis'
@@ -265,5 +265,90 @@ describe('useBestOfNAnalysis', () => {
     expect(session).toEqual({ ticker: 'AMZN', taskId: 'saved-deep-task', startedAt: 456 })
     expect(global.fetch).not.toHaveBeenCalled()
     expect(MockEventSource.latest().url).toBe('/api/analyze/best-of-n/stream/saved-deep-task')
+  })
+
+  describe('automatic reconnect and elapsed time', () => {
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] })
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('reconnects to the same task after a connection failure and rebuilds candidates from the replay without duplicates', async () => {
+      const { result } = renderHook(() => useBestOfNAnalysis())
+      await act(async () => {
+        await result.current.start('AMZN')
+      })
+      const scored = { type: 'candidate_scored', candidate_index: 0, temperature: 0.3, total_score: 80, rule_score: {}, llm_score: null, llm_reason: null }
+      act(() => MockEventSource.latest().emit(scored))
+
+      act(() => MockEventSource.latest().triggerError())
+      expect(result.current.streamError).toBeNull()
+      act(() => vi.advanceTimersByTime(1000))
+      expect(result.current.candidates).toHaveLength(1) // 重连成功前旧内容保留
+
+      act(() => MockEventSource.latest().emit(scored)) // 后端从头重放
+
+      expect(MockEventSource.instances).toHaveLength(2)
+      expect(MockEventSource.latest().url).toBe('/api/analyze/best-of-n/stream/mock-task-1')
+      expect(result.current.candidates).toHaveLength(1)
+    })
+
+    it('reports a connection error only after every retry has failed', async () => {
+      const { result } = renderHook(() => useBestOfNAnalysis())
+      await act(async () => {
+        await result.current.start('AMZN')
+      })
+
+      for (const delay of [1000, 2000, 4000, 8000, 16000]) {
+        act(() => MockEventSource.latest().triggerError())
+        act(() => vi.advanceTimersByTime(delay))
+      }
+      act(() => MockEventSource.latest().triggerError())
+
+      expect(MockEventSource.instances).toHaveLength(6)
+      expect(result.current.done).toBe(true)
+      expect(result.current.streamError).toBe('与服务器的连接中断')
+    })
+
+    it('uses the server-reported elapsed_ms as the final duration after resume()', () => {
+      sessionStorage.setItem(
+        'fin-report-agent:deep-task',
+        JSON.stringify({ ticker: 'AMZN', taskId: 'saved-deep-task', startedAt: Date.now() - 30 * 60_000 })
+      )
+      const { result } = renderHook(() => useBestOfNAnalysis())
+      act(() => {
+        result.current.resume()
+      })
+      expect(result.current.elapsedMs).toBe(30 * 60_000)
+
+      act(() =>
+        MockEventSource.latest().emit({
+          type: 'done',
+          result: { candidates: [], selected_index: 0 },
+          elapsed_ms: 300_000,
+        })
+      )
+
+      expect(result.current.elapsedMs).toBe(300_000)
+    })
+  })
+
+  it('cancel() POSTs to the cancel endpoint and a cancelled event marks cancelled, not an error', async () => {
+    const { result } = renderHook(() => useBestOfNAnalysis())
+    await act(async () => {
+      await result.current.start('AMZN')
+    })
+
+    await act(async () => {
+      await result.current.cancel()
+    })
+    act(() => MockEventSource.latest().emit({ type: 'error', code: 'cancelled', message: '分析已取消' }))
+
+    expect(global.fetch.mock.calls[1][0]).toBe('/api/analyze/tasks/mock-task-1/cancel')
+    expect(result.current.cancelled).toBe(true)
+    expect(result.current.streamError).toBeNull()
   })
 })

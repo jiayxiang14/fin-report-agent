@@ -333,6 +333,30 @@ export default function ReportPanel({ result }) {
                       数字可追溯率偏低，要求补充说明后仍未改善
                     </span>
                   ))}
+                {result.verification_coverage_gate_triggered &&
+                  (result.verification_coverage_gate_resolved ? (
+                    <span className="flex items-center gap-1">
+                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+                      已改为核实简报中实际写下的数字
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1 text-amber-600">
+                      <AlertTriangle className="h-3.5 w-3.5" />
+                      核实过的数字没有出现在简报中
+                    </span>
+                  ))}
+                {result.data_gap_disclosure_gate_triggered &&
+                  (result.data_gap_disclosure_gate_resolved ? (
+                    <span className="flex items-center gap-1">
+                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+                      有数据未能获取，已要求在异常提示中写明
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1 text-amber-600">
+                      <AlertTriangle className="h-3.5 w-3.5" />
+                      有数据未能获取，但异常提示中没有写明
+                    </span>
+                  ))}
                 {result.sentiment_consistency_gate_triggered &&
                   (result.sentiment_consistency_gate_resolved ? (
                     <span className="flex items-center gap-1">

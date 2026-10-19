@@ -6,7 +6,9 @@ import {
   Compass,
   FileText,
   Loader2,
+  RotateCcw,
   ShieldCheck,
+  Square,
   Sparkles,
   TrendingUp,
   Users,
@@ -42,6 +44,23 @@ function toolLabel(name) {
 
 function toolIcon(name) {
   return TOOL_ICONS[name] || Sparkles
+}
+
+function formatTokenCount(n) {
+  return n.toLocaleString('en-US')
+}
+
+// 成本是价格表估算出来的，模型不在表里时后端给的是null——展示"成本未知"，
+// 不能悄悄当成0（那样看起来像"这次运行免费"），token数字本身永远是真实的，
+// 跟能不能估出美元成本无关
+function UsageSummary({ inputTokens, outputTokens, cacheReadTokens, costUsd }) {
+  return (
+    <>
+      {formatTokenCount(inputTokens)} in / {formatTokenCount(outputTokens)} out tokens
+      {cacheReadTokens > 0 && `（其中 ${formatTokenCount(cacheReadTokens)} 命中缓存）`}
+      {costUsd != null ? `，预估花费 $${costUsd.toFixed(4)}` : '，预估成本未知（当前模型不在价格表里）'}
+    </>
+  )
 }
 
 // 按 turn 分组，而不是把所有事件摊平成一条时间线——Agent Loop真正的运作方式是
@@ -133,7 +152,23 @@ function ReasoningText({ text }) {
   )
 }
 
+// 后端的 resumed 事件：服务重启后自动恢复，或用户点了从断点重试
+const RESUME_REASON_LABELS = {
+  server_restart: '服务重启后自动恢复',
+  retry: '从断点重试',
+}
+
 function LogEntry({ entry }) {
+  if (entry.kind === 'resumed') {
+    return (
+      <div className="flex items-start gap-2">
+        <RotateCcw className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+        <span className="text-amber-700">
+          {RESUME_REASON_LABELS[entry.reason] ?? '恢复运行'}，从第 {entry.turn + 1} 轮继续
+        </span>
+      </div>
+    )
+  }
   if (entry.kind === 'reasoning') {
     return (
       <div className="flex items-start gap-2">
@@ -164,7 +199,19 @@ function LogEntry({ entry }) {
   )
 }
 
-export default function AgentReasoningPanel({ log, result, streamError, done, elapsedMs }) {
+export default function AgentReasoningPanel({
+  log,
+  result,
+  streamError,
+  retryable,
+  cancelled,
+  onCancel,
+  onRetry,
+  done,
+  elapsedMs,
+  liveReasoning,
+  usageTotals,
+}) {
   const groups = groupByTurn(log)
 
   return (
@@ -193,10 +240,39 @@ export default function AgentReasoningPanel({ log, result, streamError, done, el
           </div>
         ))}
 
+        {/* 逐token增量文字——正式的 reasoning 日志条目要等这一轮完全结束才
+            会出现，这里让用户在等待期间就能看到模型正在写什么，不是干等
+            一个转圈图标。这一轮结束后 liveReasoning 会被清空，转由上面
+            group里落地的正式条目接管，不会重复展示 */}
+        {!done && liveReasoning?.text && (
+          <div className="flex items-start gap-2 pl-9 text-sm">
+            <Sparkles className="mt-0.5 h-4 w-4 shrink-0 animate-pulse text-violet-300" />
+            <span className="text-gray-400">{liveReasoning.text}</span>
+          </div>
+        )}
+
         {!done && (
           <div className="flex items-center gap-2 pl-9 text-sm text-gray-300">
             <Loader2 className="h-4 w-4 animate-spin" />
             分析中…{elapsedMs != null && `（已用时 ${formatElapsed(elapsedMs)}）`}
+            {usageTotals && usageTotals.inputTokens + usageTotals.outputTokens > 0 && (
+              // 跑到一半时不展示美元成本——价格表只在后端维护一份，前端不重复
+              // 一份算法，避免两边价格算法或价格表哪天改了却只改一处的漂移
+              <span>
+                （已用 {formatTokenCount(usageTotals.inputTokens)} in /{' '}
+                {formatTokenCount(usageTotals.outputTokens)} out tokens）
+              </span>
+            )}
+            {onCancel && (
+              <button
+                type="button"
+                onClick={onCancel}
+                className="ml-auto inline-flex items-center gap-1 rounded-md border border-gray-200 px-2 py-0.5 text-xs text-gray-500 hover:border-red-200 hover:text-red-600"
+              >
+                <Square className="h-3 w-3" />
+                停止分析
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -205,15 +281,46 @@ export default function AgentReasoningPanel({ log, result, streamError, done, el
         <p className="mt-1 text-xs text-gray-400">
           {elapsedMs != null && `本次分析用时 ${formatElapsed(elapsedMs)}，`}
           Agent自主决定跑了 {result.turns_used} 轮工具调用/推理，具体轮数和每轮的
-          工具调用由模型根据这家公司的实际情况动态决定，不是固定流程
+          工具调用由模型根据这家公司的实际情况动态决定，不是固定流程。
+          {result.total_input_tokens != null && (
+            <>
+              {' '}
+              共消耗{' '}
+              <UsageSummary
+                inputTokens={result.total_input_tokens}
+                outputTokens={result.total_output_tokens}
+                cacheReadTokens={result.total_cache_read_input_tokens}
+                costUsd={result.estimated_cost_usd}
+              />
+            </>
+          )}
+        </p>
+      )}
+
+      {cancelled && (
+        <p className="mt-2 flex items-center gap-1.5 text-sm text-gray-500">
+          <Square className="h-4 w-4" />
+          已停止分析{elapsedMs != null && `（运行了 ${formatElapsed(elapsedMs)}）`}
         </p>
       )}
 
       {streamError && (
-        <p className="mt-2 flex items-center gap-1.5 text-sm text-red-600">
-          <XCircle className="h-4 w-4" />
-          分析失败：{streamError}
-        </p>
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-red-600">
+          <span className="flex items-center gap-1.5">
+            <XCircle className="h-4 w-4" />
+            分析失败：{streamError}
+          </span>
+          {retryable && onRetry && (
+            <button
+              type="button"
+              onClick={onRetry}
+              className="inline-flex items-center gap-1 rounded-md border border-red-200 px-2 py-0.5 text-xs text-red-600 hover:bg-red-50"
+            >
+              <RotateCcw className="h-3 w-3" />
+              从断点重试
+            </button>
+          )}
+        </div>
       )}
     </Panel>
   )

@@ -176,6 +176,8 @@ def test_all_resolved_default_true_for_empty_final_state():
         "verification_mismatch": True,  # 没有核查记录，vacuous true
         "traceability": True,  # total=0，vacuous true
         "sentiment_consistency": True,  # 没有sentiment标签，vacuous true
+        "data_gap_disclosure": True,  # 没有失败的工具调用，vacuous true
+        "verification_coverage": True,  # 没有核实记录，vacuous true
     }
 
 
@@ -184,7 +186,7 @@ class FakeLLMClient:
         self._responses = list(responses)
         self.calls = 0
 
-    async def create_message(self, system, messages, tools, temperature=None):
+    async def create_message(self, system, messages, tools, temperature=None, on_text_delta=None):
         response = self._responses[self.calls]
         self.calls += 1
         return response

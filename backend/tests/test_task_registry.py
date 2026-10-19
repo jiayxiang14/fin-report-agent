@@ -74,6 +74,33 @@ def test_late_subscriber_receives_full_history_replay_then_live_events():
     assert events[-1]["result"] == {"final_report": "ok"}
 
 
+def test_terminal_events_carry_server_side_elapsed_ms():
+    """前端刷新页面接回一个早已跑完的task时，没法自己算出这次分析的真实用时
+    （只知道发起时间，算出来的会把跑完之后的空闲时间也算进去），所以总用时
+    必须由后端在done/error事件里给出。"""
+
+    async def slow_runner(on_event):
+        await asyncio.sleep(0.03)
+        return {"final_report": "ok"}
+
+    async def failing_runner(on_event):
+        await asyncio.sleep(0.03)
+        raise RuntimeError("boom")
+
+    async def run():
+        done_id = task_registry.start_task("AAPL", slow_runner)
+        error_id = task_registry.start_task("AAPL", failing_runner)
+        await asyncio.sleep(0.1)
+        return await _collect(done_id), await _collect(error_id)
+
+    done_events, error_events = asyncio.run(run())
+
+    assert done_events[-1]["type"] == "done"
+    assert 30 <= done_events[-1]["elapsed_ms"] < 1000
+    assert error_events[-1]["type"] == "error"
+    assert 30 <= error_events[-1]["elapsed_ms"] < 1000
+
+
 def test_subscriber_connected_before_completion_receives_events_as_they_happen():
     """订阅发生在task还没跑完的时候——不是"跑完了再读"，是"边跑边收"，
     模拟真实场景里前端在分析进行中就已经连着的情况。"""
@@ -165,3 +192,42 @@ def test_evicted_task_is_no_longer_subscribable():
     task_id = asyncio.run(run())
 
     assert task_id not in task_registry._tasks
+
+
+def test_completed_task_no_longer_in_memory_is_replayed_from_trace_log(tmp_path):
+    """进程重启后内存里的任务表是空的——已经跑完的task应该能从trace日志重放，
+    而不是让用户看到"找不到任务"。"""
+    task_id = "f" * 32
+    with patch.object(trace_log, "TRACE_DIR", tmp_path):
+        trace_log.append_event(task_id, {"type": "reasoning", "turn": 0, "text": "a"})
+        trace_log.append_event(task_id, {"type": "tool_result_full", "tool_name": "x", "output": "{}"})
+        trace_log.append_event(task_id, {"type": "done", "result": {"final_report": "ok"}})
+        events = asyncio.run(_collect(task_id))
+
+    assert events == [{"type": "reasoning", "turn": 0, "text": "a"}, {"type": "done", "result": {"final_report": "ok"}}]
+
+
+def test_unfinished_task_in_trace_log_is_still_reported_as_not_found(tmp_path):
+    task_id = "f" * 32
+    with patch.object(trace_log, "TRACE_DIR", tmp_path):
+        trace_log.append_event(task_id, {"type": "reasoning", "turn": 0, "text": "a"})
+        events = asyncio.run(_collect(task_id))
+
+    assert events[-1]["code"] == "task_not_found"
+
+
+def test_rebuild_from_trace_truncates_at_resumed_markers(tmp_path):
+    task_id = "f" * 32
+    with patch.object(trace_log, "TRACE_DIR", tmp_path):
+        for event in [
+            {"type": "reasoning", "text": "a"},
+            {"type": "reasoning", "text": "半截"},
+            {"type": "error", "message": "502"},
+            {"type": "resumed", "truncate_to": 1},
+            {"type": "reasoning", "text": "b"},
+        ]:
+            trace_log.append_event(task_id, event)
+        events = task_registry.rebuild_events_from_trace(task_id)
+
+    assert [e["type"] for e in events] == ["reasoning", "resumed", "reasoning"]
+    assert [e.get("text") for e in events] == ["a", None, "b"]

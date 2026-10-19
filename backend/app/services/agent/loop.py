@@ -16,10 +16,23 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 from app.models.agent import AgentRunResult, ReasoningNote, TranscriptEntry
-from app.services.agent.llm_client import CACHEABLE_CONTENT_THRESHOLD, ToolCall, ToolResult, get_llm_client
+from app.services.agent import llm_pricing
+from app.services.agent.checkpoint import LoopState, ResumePoint
+from app.services.agent.llm_client import (
+    CACHEABLE_CONTENT_THRESHOLD,
+    LLMResponse,
+    LLMUsage,
+    ToolCall,
+    ToolResult,
+    get_llm_client,
+)
 from app.services.agent.system_prompt import SYSTEM_PROMPT
 from app.services.agent.tools import TOOL_SCHEMAS, execute_tool
-from app.services.agent.traceability import find_unverifiable_claims, score_traceability
+from app.services.agent.traceability import (
+    find_unverifiable_claims,
+    report_mentions_value,
+    score_traceability,
+)
 from app.services.polygon_client import CACHE_DIR
 
 MAX_TURNS = 8
@@ -172,6 +185,61 @@ def _missing_required_tools(transcript: list[TranscriptEntry]) -> frozenset[str]
     return _REQUIRED_TOOLS_BEFORE_CONCLUSION - called
 
 
+# 数据缺失披露：工具调用失败、而且之后没有重新成功拿到数据时，简报的<flags>
+# 里必须写明缺了哪个数据源——借鉴claude-quickstarts的daily-brief："读不到的
+# 数据源要报告为'无法读取'，绝不能当作'今天没新消息'"。之前只在Prompt里要求
+# （retrieval.md的工具失败说明、analysis.md异常检查清单第5条），提不提全靠
+# 模型自觉，代码不检查。
+# 判断方式是确定性的关键词共现：<flags>里同一句话（按换行/句号/分号切分）
+# 同时出现"缺失类措辞"和这个工具对应数据的关键词，就算写明了。不判断写得好
+# 不好，只确保"缺了数据"这件事没有被静默跳过。verify_number不在范围内——它
+# 失败通常是核查请求本身的问题（指标/期间写错），不是简报缺了哪类数据。
+_DATA_GAP_PHRASES = re.compile(
+    r"未能获取|无法获取|获取失败|未获取|没有获取|没能获取|调用失败|数据缺失|缺失|不可用|"
+    r"无法取得|未能取得|暂缺|拿不到|无法读取|未能读取|没有拿到|未拿到"
+)
+_TOOL_GAP_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "get_financials": ("财务数据", "财务指标", "营收", "利润", "XBRL"),
+    "get_sector_position": ("板块", "轮动", "行业ETF", "SPDR"),
+    "get_thematic_flow": ("主题", "产业链", "细分"),
+    "get_peer_comparison": ("同行", "同业", "可比公司"),
+    "get_filing_text": ("财报原文", "原文", "10-K", "10-Q", "20-F", "年报", "季报", "风险披露"),
+    "get_price_reaction": ("股价", "价格反应", "成交量", "市场反应"),
+    "get_earnings_surprise": ("预期", "EPS", "每股收益"),
+}
+_TOOL_GAP_LABELS: dict[str, str] = {
+    "get_financials": "核心财务数据（get_financials）",
+    "get_sector_position": "板块轮动位置（get_sector_position）",
+    "get_thematic_flow": "细分主题轮动（get_thematic_flow）",
+    "get_peer_comparison": "同行对比（get_peer_comparison）",
+    "get_filing_text": "财报原文（get_filing_text）",
+    "get_price_reaction": "财报后股价反应（get_price_reaction）",
+    "get_earnings_surprise": "EPS超预期幅度（get_earnings_surprise）",
+}
+_FLAGS_SEGMENT_SPLIT = re.compile(r"[\n。；;]")
+
+
+def _unrecovered_failed_tools(transcript: list[TranscriptEntry]) -> list[str]:
+    """失败过、而且之后没有任何一次成功调用的工具（换参数重试成功了就不算缺失）。"""
+    failed = {entry.tool_name for entry in transcript if entry.is_error}
+    succeeded = {entry.tool_name for entry in transcript if not entry.is_error}
+    return sorted((failed - succeeded) & _TOOL_GAP_KEYWORDS.keys())
+
+
+def _undisclosed_data_gaps(report_text: str, transcript: list[TranscriptEntry]) -> list[str]:
+    missing_tools = _unrecovered_failed_tools(transcript)
+    if not missing_tools:
+        return []
+    match = _REPORT_TAG_PATTERN["flags"].search(report_text)
+    flags = match.group(1) if match else ""
+    gap_segments = [seg for seg in _FLAGS_SEGMENT_SPLIT.split(flags) if _DATA_GAP_PHRASES.search(seg)]
+    return [
+        tool
+        for tool in missing_tools
+        if not any(keyword in seg for seg in gap_segments for keyword in _TOOL_GAP_KEYWORDS[tool])
+    ]
+
+
 # sentiment与市场反应一致性：<sentiment>是模型对自己<conclusion>的归纳，本质是
 # 主观判断，代码没法判断它"对不对"——但能检测一种具体、真实存在的矛盾：
 # sentiment标注positive，但get_price_reaction显示财报后股价明显下跌（或反过来），
@@ -254,6 +322,7 @@ def _compute_gate_resolutions(
     verify_number_outcomes: list[tuple[str, str, bool | None]],
     traceable_matched: int,
     traceable_total: int,
+    verified_values: list[float] | None = None,
 ) -> dict[str, bool]:
     """gate触发之后，模型的后续回应有没有真的解决问题，不能只看"插过nudge"这一
     个历史事实——nudge插入后，如果模型没有照做（比如只写一句"已修正"不重新
@@ -290,6 +359,8 @@ def _compute_gate_resolutions(
         "verification_mismatch": not _unresolved_verification_mismatches(verify_number_outcomes),
         "traceability": traceability_resolved,
         "sentiment_consistency": not _sentiment_still_contradicts_price_reaction(text, raw_tool_outputs),
+        "data_gap_disclosure": not _undisclosed_data_gaps(text, transcript),
+        "verification_coverage": _verification_covers_report(text, verified_values or []),
     }
 
 
@@ -304,6 +375,11 @@ OnToolResult = Callable[[str, str], Awaitable[None]]
 # 只负责"要不要插一条消息、要不要再走一轮"这个机制本身。
 ReflexionCheck = Callable[[list[ReasoningNote], list[TranscriptEntry]], Awaitable[str | None]]
 
+# 检查点回调：(phase, turn, 当前完整状态, phase=="llm_done"时这一轮的LLM响应)。
+# 同步函数——落盘本身是同步I/O，跟trace_log同一个模式；loop.py只负责在对的
+# 时机交出状态，不关心存到哪里（见checkpoint.py）
+OnCheckpoint = Callable[[str, int, LoopState, LLMResponse | None], None]
+
 
 def _summarize(content: str) -> str:
     if len(content) <= SUMMARY_LENGTH:
@@ -315,9 +391,46 @@ def _has_self_verification(transcript: list[TranscriptEntry]) -> bool:
     return any(entry.tool_name == "verify_number" and not entry.is_error for entry in transcript)
 
 
+def _verification_covers_report(report_text: str, verified_values: list[float]) -> bool:
+    """核实过的数字里，至少有一个确实写进了简报。全链路评测发现：Agent在24次运行里
+    全部是先核实"打算写的数字"、下一轮才写简报——原来的检查只看有没有调用过
+    verify_number，核实的数字跟最后写进去的不一定是同一个，核查就失去了意义。
+    这里不规定先后顺序（强制顺序会多跑一轮），只要求核实的对象是简报里真的写了的
+    数字。还没做任何核实时返回True——那是"没做自我核查"那条检查的事，不在这里重复。"""
+    if not verified_values:
+        return True
+    return any(report_mentions_value(report_text, value) for value in verified_values)
+
+
+def _usage_result_fields(
+    total_input_tokens: int,
+    total_output_tokens: int,
+    total_cache_creation_input_tokens: int,
+    total_cache_read_input_tokens: int,
+    model: str,
+) -> dict:
+    """两个return点（正常收尾 + max_turns耗尽）都要拼出同样这几个字段，抽出来
+    避免重复。`model`传空字符串（比如一轮都没跑成功）时`estimate_cost_usd`
+    在价格表里查不到，返回None，如实反映"这次没花钱/成本未知"，不是0。"""
+    usage = LLMUsage(
+        input_tokens=total_input_tokens,
+        output_tokens=total_output_tokens,
+        cache_creation_input_tokens=total_cache_creation_input_tokens,
+        cache_read_input_tokens=total_cache_read_input_tokens,
+    )
+    return {
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "total_cache_creation_input_tokens": total_cache_creation_input_tokens,
+        "total_cache_read_input_tokens": total_cache_read_input_tokens,
+        "estimated_cost_usd": llm_pricing.estimate_cost_usd(model, usage),
+    }
+
+
 # 之前6道gate是逐个检测、逐个拦截——测到第一个有问题的就continue，下一轮
 # 才测下一个，最坏情况6道gate各拦一次=最多6轮，直接挤占MAX_TURNS预算（真实
-# 观测到过一次max_turns_exceeded）。现在改成一次性测完6项、把所有真正有
+# 观测到过一次max_turns_exceeded）。现在改成一次性测完所有项（后来加了第7道
+# 数据缺失披露）、把所有真正有
 # 问题的收集起来合成一条消息、只continue一次——最坏情况降到1轮，模型也能
 # 看到问题全貌一次性处理，不用在"改完A又被B拦下"的拉锯里来回折腾。
 def _build_combined_gate_nudge(issues: list[str]) -> str:
@@ -366,62 +479,158 @@ async def run_agent_loop(
     on_tool_result: OnToolResult | None = None,
     reflexion_check: ReflexionCheck | None = None,
     enable_compaction: bool = True,
+    on_checkpoint: OnCheckpoint | None = None,
+    resume_from: ResumePoint | None = None,
 ) -> AgentRunResult:
+    """`on_checkpoint`/`resume_from`见checkpoint.py：前者在每轮开头和LLM返回后
+    交出完整状态供落盘，后者从某个存档点接着跑——两个都不传时行为跟原来完全一样。"""
+
     async def emit(event: dict) -> None:
         if on_event is not None:
             await on_event(event)
 
     llm = get_llm_client()
-    messages = [{"role": "user", "content": f"分析 {ticker} 的投资价值，形成投研简报。"}]
-    transcript: list[TranscriptEntry] = []
-    reasoning_notes: list[ReasoningNote] = []
+    # 所有跨轮次存活的状态都从一个LoopState里解出来：全新运行时是初始值，
+    # 恢复时是存档里的值——两条路径共用下面同一段代码，不会出现"恢复时漏还原
+    # 了某个标记"的情况
+    initial = (
+        resume_from.state
+        if resume_from is not None
+        else LoopState(messages=[{"role": "user", "content": f"分析 {ticker} 的投资价值，形成投研简报。"}])
+    )
+    messages = list(initial.messages)
+    transcript: list[TranscriptEntry] = list(initial.transcript)
+    reasoning_notes: list[ReasoningNote] = list(initial.reasoning_notes)
     # 独立于 on_tool_result 回调（那个只服务 Best-of-N 打分）的内部收集，给
     # 事后的数字可追溯性校验用——本函数自己需要这份完整数据，不该依赖调用方
     # 有没有传这个可选回调
-    raw_tool_outputs: list[str] = []
+    raw_tool_outputs: list[str] = list(initial.raw_tool_outputs)
     # 按发生顺序记录每一次成功的 verify_number 调用返回的 (metric, period,
     # matches)——带上metric/period是为了能按各自的指标分别判断"最近一次
     # 核查有没有真的对上"，不能把整个列表拍平只看最后一个元素（否则核查A
     # 指标发现不对之后，紧接着核查B指标恰好对上，A的mismatch会被B"顺手"
     # 掩盖掉，见 _latest_verification_outcomes）
-    verify_number_outcomes: list[tuple[str, str, bool | None]] = []
+    verify_number_outcomes: list[tuple[str, str, bool | None]] = list(initial.verify_number_outcomes)
+    verified_values: list[float] = list(initial.verified_values)
     # tool_use_id -> tool_name，供 _compact_seen_tool_results 判断某条
     # tool_result 是不是 _COMPACTION_EXEMPT_TOOLS 里的豁免工具——messages
     # 里的 tool_result block 本身只有 tool_use_id，没有工具名
-    tool_call_names: dict[str, str] = {}
+    tool_call_names: dict[str, str] = dict(initial.tool_call_names)
     response = None
-    # 6道确定性gate（结构/工具覆盖/自我核查/核查一致性/可追溯率/sentiment
-    # 一致性）现在批量检测、只用一个标记控制"只拦一次"——不再是每道gate各自
+    # 7道确定性gate（结构/工具覆盖/自我核查/核查一致性/可追溯率/sentiment
+    # 一致性/数据缺失披露）现在批量检测、只用一个标记控制"只拦一次"——不再是每道gate各自
     # 一个nudged_for_X
-    nudged_for_gate_batch = False
+    nudged_for_gate_batch = initial.nudged_for_gate_batch
     # 批量nudge发出去之后，模型完全没有重新输出任何标签（不是"重新输出了但
     # 还是有问题"）时，再给一次机会——同样只拦一次
-    nudged_for_ignored_format = False
-    nudged_for_reflexion = False
-    reflexion_triggered = False
-    structure_gate_triggered = False
-    tool_coverage_gate_triggered = False
-    verification_mismatch_triggered = False
-    traceability_gate_triggered = False
-    sentiment_consistency_gate_triggered = False
+    nudged_for_ignored_format = initial.nudged_for_ignored_format
+    nudged_for_reflexion = initial.nudged_for_reflexion
+    reflexion_triggered = initial.reflexion_triggered
+    structure_gate_triggered = initial.structure_gate_triggered
+    tool_coverage_gate_triggered = initial.tool_coverage_gate_triggered
+    verification_mismatch_triggered = initial.verification_mismatch_triggered
+    traceability_gate_triggered = initial.traceability_gate_triggered
+    sentiment_consistency_gate_triggered = initial.sentiment_consistency_gate_triggered
+    data_gap_disclosure_gate_triggered = initial.data_gap_disclosure_gate_triggered
+    verification_coverage_gate_triggered = initial.verification_coverage_gate_triggered
+    # 全程累计的token用量，两个return点都要用——model名每轮其实都一样（同一个
+    # llm client），但读最后一次成功响应的最方便，不用在函数顶部单独存一份
+    total_input_tokens = initial.total_input_tokens
+    total_output_tokens = initial.total_output_tokens
+    total_cache_creation_input_tokens = initial.total_cache_creation_input_tokens
+    total_cache_read_input_tokens = initial.total_cache_read_input_tokens
+    last_model = initial.last_model
 
-    for turn in range(max_turns):
-        response = await llm.create_message(
-            system=SYSTEM_PROMPT, messages=messages, tools=TOOL_SCHEMAS, temperature=temperature
+    def _checkpoint(phase: str, turn: int, pending: LLMResponse | None = None) -> None:
+        if on_checkpoint is None:
+            return
+        on_checkpoint(
+            phase,
+            turn,
+            LoopState(
+                messages=list(messages),
+                transcript=list(transcript),
+                reasoning_notes=list(reasoning_notes),
+                raw_tool_outputs=list(raw_tool_outputs),
+                verify_number_outcomes=list(verify_number_outcomes),
+                verified_values=list(verified_values),
+                tool_call_names=dict(tool_call_names),
+                nudged_for_gate_batch=nudged_for_gate_batch,
+                nudged_for_ignored_format=nudged_for_ignored_format,
+                nudged_for_reflexion=nudged_for_reflexion,
+                reflexion_triggered=reflexion_triggered,
+                structure_gate_triggered=structure_gate_triggered,
+                tool_coverage_gate_triggered=tool_coverage_gate_triggered,
+                verification_mismatch_triggered=verification_mismatch_triggered,
+                traceability_gate_triggered=traceability_gate_triggered,
+                sentiment_consistency_gate_triggered=sentiment_consistency_gate_triggered,
+                data_gap_disclosure_gate_triggered=data_gap_disclosure_gate_triggered,
+                verification_coverage_gate_triggered=verification_coverage_gate_triggered,
+                total_input_tokens=total_input_tokens,
+                total_output_tokens=total_output_tokens,
+                total_cache_creation_input_tokens=total_cache_creation_input_tokens,
+                total_cache_read_input_tokens=total_cache_read_input_tokens,
+                last_model=last_model,
+            ),
+            pending,
         )
-        messages = llm.append_assistant_turn(messages, response)
 
-        # 不管这一轮是不是同时调用了工具，模型写的文字都要留痕——之前只在最后
-        # 一轮才读 response.text，中间轮次的推理文字（比如"先查数据，异常再看财报"）
-        # 会被静默丢弃，既丢了第4阶段要展示的推理过程，也没法验证自我核查是不是
-        # 真的发生在草稿之后
-        if response.text:
-            reasoning_notes.append(ReasoningNote(turn=turn, text=response.text))
-            await emit({"type": "reasoning", "turn": turn, "text": response.text})
+    start_turn = resume_from.turn if resume_from is not None else 0
+    # 从llm_done恢复：那一轮的LLM调用已经做完、钱已经花了，assistant消息也已经
+    # 在messages里——跳过调用，直接用存下来的响应往下走（只重跑工具/gate）
+    resumed_response = (
+        resume_from.pending_response if resume_from is not None and resume_from.phase == "llm_done" else None
+    )
+
+    for turn in range(start_turn, max_turns):
+        if turn == start_turn and resumed_response is not None:
+            response = resumed_response
+        else:
+            # 存档点1：每轮开头。被质量检查打回的continue也会走到这里，所以
+            # nudge消息和对应标记都会被存进去，不用在每个continue前单独存
+            _checkpoint("turn_start", turn)
+
+            async def _on_text_delta(delta: str, _turn: int = turn) -> None:
+                await emit({"type": "reasoning_delta", "turn": _turn, "text": delta})
+
+            response = await llm.create_message(
+                system=SYSTEM_PROMPT,
+                messages=messages,
+                tools=TOOL_SCHEMAS,
+                temperature=temperature,
+                on_text_delta=_on_text_delta,
+            )
+            messages = llm.append_assistant_turn(messages, response)
+            total_input_tokens += response.usage.input_tokens
+            total_output_tokens += response.usage.output_tokens
+            total_cache_creation_input_tokens += response.usage.cache_creation_input_tokens
+            total_cache_read_input_tokens += response.usage.cache_read_input_tokens
+            last_model = response.model
+            await emit(
+                {
+                    "type": "llm_usage",
+                    "turn": turn,
+                    "input_tokens": response.usage.input_tokens,
+                    "output_tokens": response.usage.output_tokens,
+                    "cache_creation_input_tokens": response.usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": response.usage.cache_read_input_tokens,
+                }
+            )
+
+            # 不管这一轮是不是同时调用了工具，模型写的文字都要留痕——之前只在最后
+            # 一轮才读 response.text，中间轮次的推理文字（比如"先查数据，异常再看财报"）
+            # 会被静默丢弃，既丢了第4阶段要展示的推理过程，也没法验证自我核查是不是
+            # 真的发生在草稿之后
+            if response.text:
+                reasoning_notes.append(ReasoningNote(turn=turn, text=response.text))
+                await emit({"type": "reasoning", "turn": turn, "text": response.text})
+
+            # 存档点2：LLM已返回（最贵的一步刚做完）、开始执行工具/gate之前
+            _checkpoint("llm_done", turn, response)
 
         if response.stop_reason != "tool_use":
             # 批量检测：把结构合规/工具使用底线/自我核查/核查一致性/可追溯率/
-            # sentiment一致性这6项一次性测完，收集所有真正有问题的项，合成
+            # sentiment一致性/数据缺失披露这7项一次性测完，收集所有真正有问题的项，合成
             # 一条消息、只continue一次——不是逐个发现逐个拦。检测逻辑复用
             # `_compute_gate_resolutions`（跟最后算resolved字段用的是同一个
             # 函数，这里`False`就是"现在有问题，要写进nudge里"），自我核查
@@ -442,6 +651,7 @@ async def run_agent_loop(
                     verify_number_outcomes,
                     batch_matched,
                     batch_total,
+                    verified_values,
                 )
                 issues: list[str] = []
                 if not _has_self_verification(transcript):
@@ -479,6 +689,23 @@ async def run_agent_loop(
                         f"股价实际变动了 {pct:+.1f}% 时，方向跟 sentiment 不一致"
                         if isinstance(pct, int | float)
                         else "<sentiment> 标注跟 get_price_reaction 反映的市场反应方向不一致"
+                    )
+
+                if not status["verification_coverage"]:
+                    verification_coverage_gate_triggered = True
+                    issues.append(
+                        "你用 verify_number 核实过的数字，没有一个出现在这份简报里——核实应该针对简报里"
+                        "实际写下的数字。请对简报中最核心的一两个数字（比如营收或净利润）调用 verify_number，"
+                        "然后重新输出简报"
+                    )
+                if not status["data_gap_disclosure"]:
+                    data_gap_disclosure_gate_triggered = True
+                    undisclosed = _undisclosed_data_gaps(candidate_report, transcript)
+                    issues.append(
+                        f"以下数据源的调用失败了、这次分析没有拿到对应数据："
+                        f"{'、'.join(_TOOL_GAP_LABELS[tool] for tool in undisclosed)}，但 <flags> 里没有说明——"
+                        "请在 <flags> 里逐条写明哪个数据源的哪类数据未能获取，以及这对结论的影响。"
+                        "只说明这次没有从该数据源拿到，不要断言这项数据本身不存在"
                     )
 
                 nudged_for_gate_batch = True
@@ -524,7 +751,8 @@ async def run_agent_loop(
             final_report = _resolve_final_report(response.text, reasoning_notes)
             traceable_matched, traceable_total = score_traceability(final_report or "", raw_tool_outputs)
             gate_resolutions = _compute_gate_resolutions(
-                final_report, transcript, raw_tool_outputs, verify_number_outcomes, traceable_matched, traceable_total
+                final_report, transcript, raw_tool_outputs, verify_number_outcomes, traceable_matched, traceable_total,
+                verified_values,
             )
             return AgentRunResult(
                 ticker=ticker,
@@ -547,9 +775,20 @@ async def run_agent_loop(
                 traceability_gate_resolved=gate_resolutions["traceability"],
                 sentiment_consistency_gate_triggered=sentiment_consistency_gate_triggered,
                 sentiment_consistency_gate_resolved=gate_resolutions["sentiment_consistency"],
+                data_gap_disclosure_gate_triggered=data_gap_disclosure_gate_triggered,
+                data_gap_disclosure_gate_resolved=gate_resolutions["data_gap_disclosure"],
+                verification_coverage_gate_triggered=verification_coverage_gate_triggered,
+                verification_coverage_gate_resolved=gate_resolutions["verification_coverage"],
                 reflexion_triggered=reflexion_triggered,
                 traceable_numbers_matched=traceable_matched,
                 traceable_numbers_total=traceable_total,
+                **_usage_result_fields(
+                    total_input_tokens,
+                    total_output_tokens,
+                    total_cache_creation_input_tokens,
+                    total_cache_read_input_tokens,
+                    last_model,
+                ),
             )
 
         async def _execute_call(call: ToolCall, _turn: int = turn) -> tuple[ToolResult, TranscriptEntry]:
@@ -585,6 +824,12 @@ async def run_agent_loop(
                             verify_number_outcomes.append(
                                 (verify_metric, verify_period, verify_matches if isinstance(verify_matches, bool) else None)
                             )
+                        # 简报声称的值和数据源的实际值都算"核实过的数"：核实发现不一致时，
+                        # 模型应该改用实际值，那时写进简报的是实际值
+                        for key in ("claimed_value", "actual_value"):
+                            value = verify_payload.get(key)
+                            if isinstance(value, int | float) and not isinstance(value, bool):
+                                verified_values.append(float(value))
                 if on_tool_result is not None:
                     await on_tool_result(call.name, output)
             summary = _summarize(output)
@@ -598,7 +843,14 @@ async def run_agent_loop(
                 }
             )
             return (
-                ToolResult(tool_call_id=call.id, content=output, is_error=is_error),
+                ToolResult(
+                    tool_call_id=call.id,
+                    content=output,
+                    is_error=is_error,
+                    # 开着上下文压缩时，非豁免工具的大块结果下一轮就会被换成
+                    # 占位符，给它打缓存标记只会白付写入溢价（见ToolResult.cacheable）
+                    cacheable=not enable_compaction or call.name in _COMPACTION_EXEMPT_TOOLS,
+                ),
                 TranscriptEntry(
                     turn=_turn,
                     tool_name=call.name,
@@ -634,7 +886,8 @@ async def run_agent_loop(
     _final_report = _resolve_final_report(response.text if response else None, reasoning_notes)
     _traceable_matched, _traceable_total = score_traceability(_final_report or "", raw_tool_outputs)
     _gate_resolutions = _compute_gate_resolutions(
-        _final_report, transcript, raw_tool_outputs, verify_number_outcomes, _traceable_matched, _traceable_total
+        _final_report, transcript, raw_tool_outputs, verify_number_outcomes, _traceable_matched, _traceable_total,
+        verified_values,
     )
     return AgentRunResult(
         ticker=ticker,
@@ -655,7 +908,18 @@ async def run_agent_loop(
         traceability_gate_resolved=_gate_resolutions["traceability"],
         sentiment_consistency_gate_triggered=sentiment_consistency_gate_triggered,
         sentiment_consistency_gate_resolved=_gate_resolutions["sentiment_consistency"],
+        data_gap_disclosure_gate_triggered=data_gap_disclosure_gate_triggered,
+        data_gap_disclosure_gate_resolved=_gate_resolutions["data_gap_disclosure"],
+        verification_coverage_gate_triggered=verification_coverage_gate_triggered,
+        verification_coverage_gate_resolved=_gate_resolutions["verification_coverage"],
         reflexion_triggered=reflexion_triggered,
         traceable_numbers_matched=_traceable_matched,
         traceable_numbers_total=_traceable_total,
+        **_usage_result_fields(
+            total_input_tokens,
+            total_output_tokens,
+            total_cache_creation_input_tokens,
+            total_cache_read_input_tokens,
+            last_model,
+        ),
     )

@@ -147,12 +147,38 @@ def _looks_like_trivial_integer(raw_token: str) -> bool:
 # 换算，几乎所有绝对金额类断言都会被判定成"无法追溯"，这是归属感知匹配上线
 # 后真实跑出来的缺口，覆盖面比预想的大得多，不是可以放着不管的边缘情况。
 # "万亿"必须排在"亿"/"万"前面，不然会被短的那个先匹配掉，永远匹配不到"万亿"
-_MAGNITUDE_SUFFIXES: tuple[tuple[str, float], ...] = (("万亿", 1e12), ("亿", 1e8), ("万", 1e4))
+_MAGNITUDE_SUFFIXES: tuple[tuple[str, float], ...] = (
+    ("万亿", 1e12),
+    ("亿", 1e8),
+    ("万", 1e4),
+    # 英文量级单位：简报里也常见"$200.606B"这种写法（AMZN的简报就是），原来只认中文
+    # 单位，"核实覆盖"检查和可追溯性检查都会把它当成200.606。长的写法排在前面，
+    # 不然"billion"会先被"b"之类的短写法截断；大小写敏感，避免把普通英文单词误认成单位
+    ("trillion", 1e12),
+    ("billion", 1e9),
+    ("million", 1e6),
+    ("bn", 1e9),
+    ("mn", 1e6),
+    ("T", 1e12),
+    ("B", 1e9),
+    ("M", 1e6),
+)
+
+
+# 数字和量级单位之间允许有空白——"1094.17 亿美元"（中间带空格）是简报里很常见的
+# 写法。原来只认紧挨着的"亿"，带空格时会被当成1094.17：全链路评测验证"核实覆盖"
+# 检查时发现的——AAPL简报明明写了"营收 1094.17 亿美元"，却被判成"核实过的数字没
+# 出现在简报里"而打回，模型为了过检查把数字改写成"109,417,000,000 美元"，还多跑了
+# 两轮；同一个bug也让可追溯性检查把这类写法一律算成"找不到依据"
+_UNIT_GAP = " \u00a0\u2009\u202f\u3000"
 
 
 def _magnitude_multiplier(text: str, end_pos: int) -> float:
+    pos = end_pos
+    while pos < len(text) and pos - end_pos < 2 and text[pos] in _UNIT_GAP:
+        pos += 1
     for suffix, multiplier in _MAGNITUDE_SUFFIXES:
-        if text[end_pos : end_pos + len(suffix)] == suffix:
+        if text[pos : pos + len(suffix)] == suffix:
             return multiplier
     return 1.0
 
@@ -379,6 +405,12 @@ def _financials_candidate_values(metrics: dict, metric: str) -> set[float]:
             if isinstance(value, int | float) and not isinstance(value, bool):
                 candidates.add(float(value))
     return candidates
+
+
+def report_mentions_value(report_text: str, value: float) -> bool:
+    """简报正文里有没有写出这个数（按跟可追溯性检查相同的规则抽取数字、换算
+    亿/万、按容差比较）——给"核实过的数字有没有出现在简报里"这道检查用。"""
+    return any(_has_close_match(claimed, {value}) for claimed in _extract_claimed_numbers(report_text))
 
 
 def _has_close_match(value: float, known: set[float]) -> bool:

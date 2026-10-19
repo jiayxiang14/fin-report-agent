@@ -4,8 +4,8 @@ import { useElapsedTimer } from './useElapsedTimer'
 
 describe('useElapsedTimer', () => {
   beforeEach(() => {
-    // performance.now() 也要跟着假时钟走，不然setInterval的回调被fake timer
-    // 推进触发了，但内部用来算elapsedMs的performance.now()读到的还是真实
+    // Date.now() 也要跟着假时钟走，不然setInterval的回调被fake timer
+    // 推进触发了，但内部用来算elapsedMs的Date.now()读到的还是真实
     // wall-clock时间，两者对不上，断言会不稳定
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date', 'performance'] })
   })
@@ -51,5 +51,33 @@ describe('useElapsedTimer', () => {
     act(() => result.current.start())
 
     expect(result.current.elapsedMs).toBe(0)
+  })
+
+  it('start(startedAtEpochMs) resumes counting from an earlier start time instead of 0', () => {
+    const { result } = renderHook(() => useElapsedTimer())
+
+    act(() => result.current.start(Date.now() - 5000))
+    expect(result.current.elapsedMs).toBe(5000)
+
+    act(() => vi.advanceTimersByTime(600))
+    expect(result.current.elapsedMs).toBeGreaterThanOrEqual(5600)
+  })
+
+  it('start() ignores a start time in the future and counts from now', () => {
+    const { result } = renderHook(() => useElapsedTimer())
+
+    act(() => result.current.start(Date.now() + 60_000))
+
+    expect(result.current.elapsedMs).toBe(0)
+  })
+
+  it('stop(finalMs) uses the authoritative value instead of the locally measured one', () => {
+    const { result } = renderHook(() => useElapsedTimer())
+
+    // 模拟刷新页面接回一个30分钟前发起、只跑了2分钟的task
+    act(() => result.current.start(Date.now() - 30 * 60_000))
+    act(() => result.current.stop(120_000))
+
+    expect(result.current.elapsedMs).toBe(120_000)
   })
 })

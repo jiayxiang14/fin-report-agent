@@ -25,7 +25,7 @@ class FakeLLMClient:
         self.calls = 0
         self.received_messages: list[list[dict]] = []
 
-    async def create_message(self, system, messages, tools, temperature=None):
+    async def create_message(self, system, messages, tools, temperature=None, on_text_delta=None):
         self.received_messages.append(messages)
         response = self._responses[self.calls]
         self.calls += 1

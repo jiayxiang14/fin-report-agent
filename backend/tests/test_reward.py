@@ -184,7 +184,7 @@ def test_length_half_marks_when_too_long():
 
 def test_llm_judge_parses_well_formed_response():
     class FakeLLM:
-        async def create_message(self, system, messages, tools, temperature=None):
+        async def create_message(self, system, messages, tools, temperature=None, on_text_delta=None):
             return LLMResponse(
                 stop_reason="end_turn",
                 text="<score>8</score>\n<reason>逻辑连贯，数据支撑充分</reason>",
@@ -201,7 +201,7 @@ def test_llm_judge_parses_well_formed_response():
 
 def test_llm_judge_degrades_gracefully_when_response_not_tagged():
     class FakeLLM:
-        async def create_message(self, system, messages, tools, temperature=None):
+        async def create_message(self, system, messages, tools, temperature=None, on_text_delta=None):
             return LLMResponse(stop_reason="end_turn", text="这份简报写得不错", tool_calls=[], raw=None)
 
     with patch("app.services.agent.reward.get_llm_client", return_value=FakeLLM()):
@@ -213,7 +213,7 @@ def test_llm_judge_degrades_gracefully_when_response_not_tagged():
 
 def test_llm_judge_degrades_gracefully_when_call_raises():
     class FakeLLM:
-        async def create_message(self, system, messages, tools, temperature=None):
+        async def create_message(self, system, messages, tools, temperature=None, on_text_delta=None):
             raise RuntimeError("上游挂了")
 
     with patch("app.services.agent.reward.get_llm_client", return_value=FakeLLM()):
@@ -235,7 +235,7 @@ def test_llm_judge_averages_scores_across_self_consistency_samples():
     scores_by_call = iter([6, 7, 8, 9, 10])
 
     class FakeLLM:
-        async def create_message(self, system, messages, tools, temperature=None):
+        async def create_message(self, system, messages, tools, temperature=None, on_text_delta=None):
             score = next(scores_by_call)
             return LLMResponse(
                 stop_reason="end_turn", text=f"<reason>理由{score}</reason>\n<score>{score}</score>", tool_calls=[], raw=None
@@ -256,7 +256,7 @@ def test_llm_judge_ensemble_ignores_failed_samples_when_averaging():
     call_count = {"n": 0}
 
     class FakeLLM:
-        async def create_message(self, system, messages, tools, temperature=None):
+        async def create_message(self, system, messages, tools, temperature=None, on_text_delta=None):
             call_count["n"] += 1
             if call_count["n"] == 2:
                 return LLMResponse(stop_reason="end_turn", text="没按格式回复", tool_calls=[], raw=None)
@@ -278,7 +278,7 @@ def test_llm_judge_ensemble_samples_use_nonzero_temperature():
     captured_temperatures: list[float | None] = []
 
     class FakeLLM:
-        async def create_message(self, system, messages, tools, temperature=None):
+        async def create_message(self, system, messages, tools, temperature=None, on_text_delta=None):
             captured_temperatures.append(temperature)
             return LLMResponse(
                 stop_reason="end_turn", text="<reason>ok</reason>\n<score>7</score>", tool_calls=[], raw=None
@@ -336,7 +336,7 @@ def test_judge_uses_settings_judge_provider_when_configured(monkeypatch):
     captured_provider = None
 
     class FakeLLM:
-        async def create_message(self, system, messages, tools, temperature=None):
+        async def create_message(self, system, messages, tools, temperature=None, on_text_delta=None):
             return LLMResponse(
                 stop_reason="end_turn", text="<score>7</score><reason>ok</reason>", tool_calls=[], raw=None
             )
@@ -357,7 +357,7 @@ def test_judge_uses_default_provider_when_not_configured(monkeypatch):
     captured_provider = "not called"
 
     class FakeLLM:
-        async def create_message(self, system, messages, tools, temperature=None):
+        async def create_message(self, system, messages, tools, temperature=None, on_text_delta=None):
             return LLMResponse(
                 stop_reason="end_turn", text="<score>7</score><reason>ok</reason>", tool_calls=[], raw=None
             )
@@ -375,7 +375,7 @@ def test_judge_uses_default_provider_when_not_configured(monkeypatch):
 
 def test_trajectory_judge_parses_well_formed_response():
     class FakeLLM:
-        async def create_message(self, system, messages, tools, temperature=None):
+        async def create_message(self, system, messages, tools, temperature=None, on_text_delta=None):
             return LLMResponse(
                 stop_reason="end_turn",
                 text="<score>7</score>\n<reason>信息收集充分，但没有验证异常数字</reason>",
@@ -408,7 +408,7 @@ def test_trajectory_judge_skips_call_when_no_trajectory():
 
 def test_trajectory_judge_degrades_gracefully_when_call_raises():
     class FakeLLM:
-        async def create_message(self, system, messages, tools, temperature=None):
+        async def create_message(self, system, messages, tools, temperature=None, on_text_delta=None):
             raise RuntimeError("上游挂了")
 
     reasoning_notes = [ReasoningNote(turn=0, text="推理")]

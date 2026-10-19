@@ -238,6 +238,48 @@ describe('ReportPanel', () => {
     expect(screen.queryByText('补查基础数据后已定稿')).not.toBeInTheDocument()
   })
 
+  it('shows the verification-coverage badge only when triggered, amber when still unresolved', () => {
+    const { rerender } = render(
+      <ReportPanel result={{ ...resultWith('结论', 'neutral'), verification_coverage_gate_triggered: true, verification_coverage_gate_resolved: true }} />
+    )
+    expect(screen.getByText('已改为核实简报中实际写下的数字')).toBeInTheDocument()
+    rerender(
+      <ReportPanel result={{ ...resultWith('结论', 'neutral'), verification_coverage_gate_triggered: true, verification_coverage_gate_resolved: false }} />
+    )
+    expect(screen.getByText('核实过的数字没有出现在简报中')).toBeInTheDocument()
+    rerender(<ReportPanel result={{ ...resultWith('结论', 'neutral'), verification_coverage_gate_triggered: false }} />)
+    expect(screen.queryByText(/核实过的数字没有出现|已改为核实简报/)).not.toBeInTheDocument()
+  })
+
+  it('shows the data-gap-disclosure badge only when triggered, amber when the gap was never written into flags', () => {
+    const { rerender } = render(
+      <ReportPanel
+        result={{
+          ...resultWith('结论', 'neutral'),
+          data_gap_disclosure_gate_triggered: true,
+          data_gap_disclosure_gate_resolved: true,
+        }}
+      />
+    )
+    expect(screen.getByText('有数据未能获取，已要求在异常提示中写明')).toBeInTheDocument()
+
+    rerender(
+      <ReportPanel
+        result={{
+          ...resultWith('结论', 'neutral'),
+          data_gap_disclosure_gate_triggered: true,
+          data_gap_disclosure_gate_resolved: false,
+        }}
+      />
+    )
+    expect(screen.getByText('有数据未能获取，但异常提示中没有写明')).toBeInTheDocument()
+
+    rerender(
+      <ReportPanel result={{ ...resultWith('结论', 'neutral'), data_gap_disclosure_gate_triggered: false }} />
+    )
+    expect(screen.queryByText(/有数据未能获取/)).not.toBeInTheDocument()
+  })
+
   it('shows the sentiment-consistency-gate badge only when it was actually triggered', () => {
     const { rerender } = render(
       <ReportPanel

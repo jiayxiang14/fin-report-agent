@@ -16,6 +16,15 @@ Agent Loop 杀掉，已经花掉的LLM调用全部白费，重连等于重新发
 Redis 只能保证已经产生的事件/结果不因为进程重启而丢，救不回"跑到一半"
 这件事本身），是完全不同量级的工程量，讨论过，这里明确不做。
 
+进程重启/手动重试后接回同一个task_id（见checkpoint.py、task_runner.py）：
+`start_task`可以传入`initial_events`（从trace日志重建、截断到存档点的历史事件）
+和原始`started_at`，订阅者照样先重放这些历史事件再接收新事件；内存里已经没有
+的、已经跑完的task，订阅时从trace日志重建事件重放（`rebuild_events_from_trace`）。
+
+取消：`cancel_task`只对用户主动取消生效——进程关闭/开发时--reload也会取消
+后台task，那种情况不发终止事件、原样向上抛，检查点保持`running`，下次启动
+时自动恢复。
+
 过期策略按"交易日"而不是滚动24小时：`_next_trading_day_start` 只跳过周末，
 不处理NYSE法定假日（一年约9天）——这是刻意的简化，假期当天会多保留一天
 缓存，代价很小，不值得为这几天/年接一份完整的交易日历。
@@ -25,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
@@ -48,17 +58,25 @@ def _next_trading_day_start(dt: datetime) -> datetime:
     return next_day
 
 
+_TERMINAL_EVENT_TYPES = frozenset({"done", "error"})
+
+
 @dataclass
 class _TaskState:
     ticker: str
+    # 墙钟时间（time.time()），不是monotonic——重启/重试接回时要跟存下来的
+    # 原始发起时间比较，monotonic的零点每次进程启动都不一样
+    started_at: float = field(default_factory=time.time)
     events: list[dict] = field(default_factory=list)
     done: bool = False
+    cancel_requested: bool = False
+    handle: asyncio.Task | None = None
     # 当前正在监听的连接，可以有0个（后台任务不依赖任何人正在看着）
     subscribers: list[asyncio.Queue] = field(default_factory=list)
     expires_at: datetime = field(init=False)
 
     def __post_init__(self) -> None:
-        self.expires_at = _next_trading_day_start(datetime.now(UTC))
+        self.expires_at = _next_trading_day_start(datetime.fromtimestamp(self.started_at, UTC))
 
 
 _tasks: dict[str, _TaskState] = {}
@@ -71,16 +89,28 @@ def _evict_expired() -> None:
         del _tasks[task_id]
 
 
-def start_task(ticker: str, runner: TaskRunner, task_id: str | None = None) -> str:
+def start_task(
+    ticker: str,
+    runner: TaskRunner,
+    task_id: str | None = None,
+    *,
+    initial_events: list[dict] | None = None,
+    started_at: float | None = None,
+) -> str:
     """创建后台任务，立刻返回task_id，不等待任务本身完成。
 
     `task_id`可以由调用方预先生成并传入（`agent.py`的路由需要在调用这个函数
     之前就知道task_id，好把它闭包进一个`on_tool_result`回调里去落盘完整的
     工具输出）——不传时保持原来的行为，内部自己生成一个。
+
+    `initial_events`/`started_at`只在接回已有task（重启恢复/手动重试）时传：
+    前者是要先填进缓冲区的历史事件（不会重复写trace日志），后者让总用时从
+    原始发起时刻算起。
     """
     _evict_expired()
     task_id = task_id or uuid.uuid4().hex
-    state = _TaskState(ticker=ticker)
+    state = _TaskState(ticker=ticker, started_at=started_at if started_at is not None else time.time())
+    state.events.extend(initial_events or [])
     _tasks[task_id] = state
 
     async def on_event(event: dict) -> None:
@@ -94,25 +124,91 @@ def start_task(ticker: str, runner: TaskRunner, task_id: str | None = None) -> s
             await queue.put(event)
 
     async def run() -> None:
+        # 总用时由后端算、随终止事件下发：前端刷新页面接回一个早已跑完的task时，
+        # 只靠前端自己记的发起时间只能算出"从发起到现在过了多久"（含跑完之后的
+        # 空闲时间），不是这次分析真正的用时
+        def elapsed_ms() -> int:
+            return round((time.time() - state.started_at) * 1000)
+
         try:
             result = await runner(on_event)
-            await on_event({"type": "done", "result": result})
+            await on_event({"type": "done", "result": result, "elapsed_ms": elapsed_ms()})
+        except asyncio.CancelledError:
+            if not state.cancel_requested:
+                # 进程关闭/--reload：不是用户的决定，不发终止事件，原样往上抛
+                raise
+            await on_event({"type": "error", "code": "cancelled", "message": "分析已取消", "elapsed_ms": elapsed_ms()})
         except Exception as exc:  # noqa: BLE001 - 后台任务的失败边界，必须转成事件，不能无声消失
-            await on_event({"type": "error", "message": str(exc)})
+            error_event: dict = {"type": "error", "message": str(exc), "elapsed_ms": elapsed_ms()}
+            # 可重试的外部故障（见checkpoint.RetryableTaskError），前端据此显示
+            # "从断点重试"按钮
+            if getattr(exc, "retryable", False):
+                error_event["retryable"] = True
+            await on_event(error_event)
         finally:
             state.done = True
             for queue in state.subscribers:
                 await queue.put(None)  # 结束哨兵
 
-    # 故意不保留这个task的引用——它完全独立于发起它的HTTP请求，不依赖任何
-    # 调用方拿着引用去管理生命周期，这正是要解决的问题本身
-    asyncio.create_task(run())
+    # 引用只存在注册表自己的状态里（给cancel_task用，也防止task被垃圾回收），
+    # 不交给发起它的HTTP请求——它的生命周期完全独立于那次请求，这正是要
+    # 解决的问题本身
+    state.handle = asyncio.create_task(run())
     return task_id
+
+
+def event_count(task_id: str) -> int:
+    """已经推送过的事件数，存检查点时一起存下来，恢复时据此截断事件历史。"""
+    state = _tasks.get(task_id)
+    return len(state.events) if state is not None else 0
+
+
+def is_running(task_id: str) -> bool:
+    state = _tasks.get(task_id)
+    return state is not None and not state.done
+
+
+def is_cancel_requested(task_id: str) -> bool:
+    state = _tasks.get(task_id)
+    return state is not None and state.cancel_requested
+
+
+def cancel_task(task_id: str) -> bool:
+    """用户主动取消。返回False表示没有正在跑的这个task（不存在/已经结束）。"""
+    state = _tasks.get(task_id)
+    if state is None or state.done or state.handle is None:
+        return False
+    state.cancel_requested = True
+    state.handle.cancel()
+    return True
+
+
+def rebuild_events_from_trace(task_id: str) -> list[dict]:
+    """从trace日志还原出订阅者应该看到的事件序列：去掉不是SSE事件的
+    `tool_result_full`和落盘时间戳；遇到`resumed`事件时，按它的`truncate_to`
+    把前面的事件截断——被打断的那一轮推出去的半截事件（推理文字推到一半、
+    工具开始了没结束），恢复后会整轮重做，不截断的话同一轮会出现两遍。"""
+    events: list[dict] = []
+    for raw in trace_log.read_trace(task_id):
+        if raw.get("type") == "tool_result_full":
+            continue
+        event = {k: v for k, v in raw.items() if k != "logged_at"}
+        if event.get("type") == "resumed" and isinstance(event.get("truncate_to"), int):
+            events = events[: event["truncate_to"]]
+        events.append(event)
+    return events
 
 
 async def _replay_and_tail(task_id: str) -> AsyncIterator[dict]:
     state = _tasks.get(task_id)
     if state is None:
+        # 内存里没有（过期被清理/进程重启过），但trace日志里能还原出一次完整
+        # 结束的运行——直接重放，不用让用户重新发起
+        trace_events = rebuild_events_from_trace(task_id)
+        if trace_events and trace_events[-1].get("type") in _TERMINAL_EVENT_TYPES:
+            for event in trace_events:
+                yield event
+            return
         # code字段给前端识别用，不能靠匹配中文文案字符串去判断"这个task该
         # 重新发起了"，那样文案一改前端逻辑就悄悄失效
         yield {"type": "error", "code": "task_not_found", "message": "task_id 不存在或已过期，请重新发起分析"}

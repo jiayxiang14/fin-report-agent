@@ -79,6 +79,15 @@ class AgentRunResult(BaseModel):
     # 语义同structure_gate_resolved——对最终的<sentiment>标签和价格反应数据
     # 重新跑一次矛盾检测，不依赖*_triggered这个历史标记
     sentiment_consistency_gate_resolved: bool = True
+    # 数据缺失披露：有工具调用失败、且之后没重新成功拿到数据时，<flags>里有没有
+    # 写明缺了哪个数据源（loop.py的_undisclosed_data_gaps）。resolved语义同上
+    data_gap_disclosure_gate_triggered: bool = False
+    data_gap_disclosure_gate_resolved: bool = True
+    # 核实过的数字有没有出现在最终简报里（loop.py的_verification_covers_report）：
+    # 全链路评测发现Agent总是先核实"打算写的数字"、下一轮才写简报，原来的检查只看
+    # "有没有调用过verify_number"，核实的数字跟写进去的不一定是同一个。resolved语义同上
+    verification_coverage_gate_triggered: bool = False
+    verification_coverage_gate_resolved: bool = True
     # Reflexion：只有传了 reflexion_check 参数的调用方（目前只有 best_of_n.py）
     # 才可能触发，普通单次分析的调用方不传这个参数，永远是 False
     reflexion_triggered: bool = False
@@ -87,3 +96,14 @@ class AgentRunResult(BaseModel):
     # 这是一个信号，不是拦截——total 为 0 表示没有可核对的数字主张，不代表有问题
     traceable_numbers_matched: int = 0
     traceable_numbers_total: int = 0
+    # 全程累计的token用量——之前上下文压缩到底省了多少钱只能凭感觉判断
+    # （开发日志里承认过这一点），有了这几个字段才能真正测出压缩前后的差异，
+    # 不是又一个凭空编出来的数字。cache_read越高说明prompt caching命中得越好，
+    # cache_creation只在第一次把内容写入缓存时非零
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cache_creation_input_tokens: int = 0
+    total_cache_read_input_tokens: int = 0
+    # 手动维护价格表算出来的估算值，模型不在表里时是None——不能把"算不出来"
+    # 悄悄展示成0，那样看起来像"这次运行免费"
+    estimated_cost_usd: float | None = None

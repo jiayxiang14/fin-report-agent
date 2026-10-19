@@ -104,7 +104,10 @@ def test_stream_route_emits_error_event_on_exception():
 
     assert response.status_code == 200
     events = _parse_sse_events(response.text)
-    assert events == [{"type": "error", "message": "Best-of-N 运行失败"}]
+    assert len(events) == 1
+    assert events[0]["type"] == "error"
+    assert events[0]["message"] == "Best-of-N 运行失败"
+    assert isinstance(events[0]["elapsed_ms"], int)
 
 
 def test_second_start_with_same_session_id_is_rejected_while_first_is_in_flight(monkeypatch):

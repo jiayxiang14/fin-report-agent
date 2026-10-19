@@ -35,140 +35,182 @@ function mapDoneCandidate(raw) {
 // 模式下用户看到的推理过程就是真正被选中展示的那份简报是怎么一步步生成的，
 // 而不是一个空面板。
 //
-// 断线重连：跟 useAgentAnalysis 同一套 start()/resume() 拆分，见那边的注释。
+// 断线重连：跟 useAgentAnalysis 同一套 start()/resume() 拆分，网络抖动自动
+// 重连的策略也一样（退避重试、新连接收到第一个事件才清空旧状态），见那边的注释。
+const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 16000]
+
 export function useBestOfNAnalysis() {
   const [candidates, setCandidates] = useState([])
   const [result, setResult] = useState(null)
   const [selectedLog, setSelectedLog] = useState([])
   const [streamError, setStreamError] = useState(null)
   const [done, setDone] = useState(false)
+  const [cancelled, setCancelled] = useState(false)
   const sourceRef = useRef(null)
+  const currentTaskRef = useRef(null)
+  const retryTimerRef = useRef(null)
   const logsByCandidateRef = useRef({})
   const nextKeyRef = useRef(0)
   const { elapsedMs, start: startTimer, stop: stopTimer } = useElapsedTimer()
 
   useEffect(() => {
     return () => {
+      clearTimeout(retryTimerRef.current)
       sourceRef.current?.close()
       stopTimer()
     }
   }, [stopTimer])
 
-  const attach = useCallback((ticker, taskId) => {
-    sourceRef.current?.close()
-    setCandidates([])
-    setResult(null)
-    setSelectedLog([])
-    setStreamError(null)
-    setDone(false)
-    logsByCandidateRef.current = {}
-    nextKeyRef.current = 0
-    startTimer()
+  const attach = useCallback((ticker, taskId, startedAt) => {
+    clearTimeout(retryTimerRef.current)
+    retryTimerRef.current = null
+    startTimer(startedAt)
+    let failures = 0
 
-    const source = new EventSource(`/api/analyze/best-of-n/stream/${taskId}`)
-    sourceRef.current = source
+    currentTaskRef.current = { taskId }
 
-    function appendToCandidateLog(candidateIndex, entry) {
-      nextKeyRef.current += 1
-      const bucket = logsByCandidateRef.current[candidateIndex] || []
-      bucket.push({ key: nextKeyRef.current, ...entry })
-      logsByCandidateRef.current[candidateIndex] = bucket
+    function resetState() {
+      setCandidates([])
+      setResult(null)
+      setSelectedLog([])
+      setStreamError(null)
+      setCancelled(false)
+      setDone(false)
+      logsByCandidateRef.current = {}
+      nextKeyRef.current = 0
     }
 
-    source.onmessage = (e) => {
-      const event = JSON.parse(e.data)
-      switch (event.type) {
-        case 'reasoning':
-          appendToCandidateLog(event.candidate_index, {
-            kind: 'reasoning',
-            turn: event.turn,
-            text: event.text,
-          })
-          break
-        case 'tool_call_started':
-          appendToCandidateLog(event.candidate_index, {
-            kind: 'tool_started',
-            turn: event.turn,
-            toolName: event.tool_name,
-          })
-          break
-        case 'tool_call_finished':
-          appendToCandidateLog(event.candidate_index, {
-            kind: 'tool_finished',
-            turn: event.turn,
-            toolName: event.tool_name,
-            isError: event.is_error,
-            summary: event.summary,
-          })
-          break
-        case 'candidate_scored':
-          setCandidates((prev) => [
-            ...prev,
-            {
-              index: event.candidate_index,
-              temperature: event.temperature,
-              totalScore: event.total_score,
-              ruleScore: event.rule_score,
-              llmScore: event.llm_score,
-              llmReason: event.llm_reason,
-              trajectoryScore: event.trajectory_score,
-              trajectoryReason: event.trajectory_reason,
-              reflexionTriggered: event.reflexion_triggered,
-              finalReport: null, // 跑的过程中先不带正文，done事件到达后统一补上
-              error: null,
-            },
-          ])
-          break
-        case 'candidate_failed':
-          // 单个候选失败（比如上游余额不足）不影响其它候选继续跑，这里先标记
-          // 出来，done事件到达后会用权威的result.candidates覆盖一次
-          setCandidates((prev) => [
-            ...prev,
-            {
-              index: event.candidate_index,
-              temperature: event.temperature,
-              totalScore: null,
-              ruleScore: null,
-              llmScore: null,
-              llmReason: null,
-              trajectoryScore: null,
-              trajectoryReason: null,
-              reflexionTriggered: null,
-              finalReport: null,
-              error: event.error,
-            },
-          ])
-          break
-        case 'done':
-          setResult(event.result)
-          setCandidates(event.result.candidates.map(mapDoneCandidate))
-          setSelectedLog(logsByCandidateRef.current[event.result.selected_index] || [])
-          setDone(true)
-          stopTimer()
-          source.close()
-          break
-        case 'error':
-          if (event.code === 'task_not_found') {
-            clearTaskSession(SESSION_KEY)
-          }
-          setStreamError(event.message)
-          setDone(true)
-          stopTimer()
-          source.close()
-          break
-        default:
-          break
+    function connect(isRetry) {
+      sourceRef.current?.close()
+      if (!isRetry) resetState()
+
+      const source = new EventSource(`/api/analyze/best-of-n/stream/${taskId}`)
+      sourceRef.current = source
+      let finished = false
+      let pendingReset = isRetry
+
+      function appendToCandidateLog(candidateIndex, entry) {
+        nextKeyRef.current += 1
+        const bucket = logsByCandidateRef.current[candidateIndex] || []
+        bucket.push({ key: nextKeyRef.current, ...entry })
+        logsByCandidateRef.current[candidateIndex] = bucket
+      }
+
+      source.onmessage = (e) => {
+        if (sourceRef.current !== source) return
+        if (pendingReset) {
+          pendingReset = false
+          failures = 0
+          resetState()
+        }
+        const event = JSON.parse(e.data)
+        switch (event.type) {
+          case 'reasoning':
+            appendToCandidateLog(event.candidate_index, {
+              kind: 'reasoning',
+              turn: event.turn,
+              text: event.text,
+            })
+            break
+          case 'tool_call_started':
+            appendToCandidateLog(event.candidate_index, {
+              kind: 'tool_started',
+              turn: event.turn,
+              toolName: event.tool_name,
+            })
+            break
+          case 'tool_call_finished':
+            appendToCandidateLog(event.candidate_index, {
+              kind: 'tool_finished',
+              turn: event.turn,
+              toolName: event.tool_name,
+              isError: event.is_error,
+              summary: event.summary,
+            })
+            break
+          case 'candidate_scored':
+            setCandidates((prev) => [
+              ...prev,
+              {
+                index: event.candidate_index,
+                temperature: event.temperature,
+                totalScore: event.total_score,
+                ruleScore: event.rule_score,
+                llmScore: event.llm_score,
+                llmReason: event.llm_reason,
+                trajectoryScore: event.trajectory_score,
+                trajectoryReason: event.trajectory_reason,
+                reflexionTriggered: event.reflexion_triggered,
+                finalReport: null, // 跑的过程中先不带正文，done事件到达后统一补上
+                error: null,
+              },
+            ])
+            break
+          case 'candidate_failed':
+            // 单个候选失败（比如上游余额不足）不影响其它候选继续跑，这里先标记
+            // 出来，done事件到达后会用权威的result.candidates覆盖一次
+            setCandidates((prev) => [
+              ...prev,
+              {
+                index: event.candidate_index,
+                temperature: event.temperature,
+                totalScore: null,
+                ruleScore: null,
+                llmScore: null,
+                llmReason: null,
+                trajectoryScore: null,
+                trajectoryReason: null,
+                reflexionTriggered: null,
+                finalReport: null,
+                error: event.error,
+              },
+            ])
+            break
+          case 'done':
+            setResult(event.result)
+            setCandidates(event.result.candidates.map(mapDoneCandidate))
+            setSelectedLog(logsByCandidateRef.current[event.result.selected_index] || [])
+            finished = true
+            setDone(true)
+            stopTimer(event.elapsed_ms)
+            source.close()
+            break
+          case 'error':
+            if (event.code === 'task_not_found') {
+              clearTaskSession(SESSION_KEY)
+            }
+            finished = true
+            // 深度分析不存检查点（见后端checkpoint.py），失败不提供断点重试
+            if (event.code === 'cancelled') {
+              setCancelled(true)
+            } else {
+              setStreamError(event.message)
+            }
+            setDone(true)
+            stopTimer(event.elapsed_ms)
+            source.close()
+            break
+          default:
+            break
+        }
+      }
+
+      source.onerror = () => {
+        source.close()
+        if (finished || sourceRef.current !== source) return
+        if (failures < RECONNECT_DELAYS_MS.length) {
+          retryTimerRef.current = setTimeout(() => connect(true), RECONNECT_DELAYS_MS[failures])
+          failures += 1
+          return
+        }
+        finished = true
+        setStreamError('与服务器的连接中断')
+        setDone(true)
+        stopTimer()
       }
     }
 
-    source.onerror = () => {
-      setDone((current) => {
-        if (!current) setStreamError('与服务器的连接中断')
-        return true
-      })
-      stopTimer()
-      source.close()
-    }
+    connect(false)
   }, [startTimer, stopTimer])
 
   const start = useCallback(
@@ -201,18 +243,29 @@ export function useBestOfNAnalysis() {
         return
       }
       const { task_id: taskId } = await response.json()
-      saveTaskSession(SESSION_KEY, { ticker, taskId, startedAt: Date.now() })
-      attach(ticker, taskId)
+      const startedAt = Date.now()
+      saveTaskSession(SESSION_KEY, { ticker, taskId, startedAt })
+      attach(ticker, taskId, startedAt)
     },
     [attach]
   )
 
+  const cancel = useCallback(async () => {
+    const current = currentTaskRef.current
+    if (!current) return
+    try {
+      await fetch(`/api/analyze/tasks/${current.taskId}/cancel`, { method: 'POST' })
+    } catch {
+      // 网络失败：分析会照常跑完，没有别的可做
+    }
+  }, [])
+
   const resume = useCallback(() => {
     const session = loadTaskSession(SESSION_KEY)
     if (!session) return null
-    attach(session.ticker, session.taskId)
+    attach(session.ticker, session.taskId, session.startedAt)
     return session
   }, [attach])
 
-  return { candidates, result, selectedLog, streamError, done, elapsedMs, start, resume }
+  return { candidates, result, selectedLog, streamError, cancelled, done, elapsedMs, start, resume, cancel }
 }

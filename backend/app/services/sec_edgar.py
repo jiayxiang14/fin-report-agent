@@ -40,6 +40,9 @@ QUARTERLY_FORMS = ("10-Q",)
 METRIC_TAGS: dict[str, list[str]] = {
     "revenue": [
         "Revenues",
+        # 银行类公司的营收标签（JPM等）——它们的"Revenues"标签只剩年度数据，
+        # 单季度数据早在2014年就停了，新的季度营收披露在这个标签下
+        "RevenuesNetOfInterestExpense",
         "RevenueFromContractWithCustomerExcludingAssessedTax",
         "RevenueFromContractWithCustomerIncludingAssessedTax",
         "SalesRevenueNet",
@@ -287,19 +290,28 @@ def _dedupe_by_end(points: list[dict]) -> list[dict]:
     return sorted(best_by_end.values(), key=lambda p: p["end"], reverse=True)
 
 
-def _select_best_tag_points(
-    us_gaap: dict, tag_candidates: list[str]
-) -> tuple[str, str, list[dict], list[dict]] | None:
-    """从候选标签里选出"最新披露"的那个标签，返回 (tag, unit_name, annual_points,
-    quarterly_points)。同一概念可能有多个候选标签（公司换过披露标签），每个都试一遍，
-    取"披露的最新一个点"最靠后的那个标签——避免选中一个已经停用多年的旧标签。
-    所有候选标签都没数据时返回 None。"""
-    best_tag = None
-    best_unit_name = None
-    best_annual_points: list[dict] = []
-    best_quarterly_points: list[dict] = []
-    best_latest_end = ""
+# 过时判断：同一个指标的候选标签里，有的公司换过标签、有的只剩年度或只剩季度
+# 数据——真实踩过的坑：JPM的"Revenues"年度数据更新到2025、单季度数据停在2014，
+# 原来的选法把年度和季度混在一起比"最新日期"，选中这个标签后把2014年Q3当成了
+# "最新一季"返回；KO/WMT的"EarningsPerShareDiluted"整个标签2009年后就停用了，
+# 照样被当成最新数据返回（公司概况的市盈率因此是拿2009年的EPS算的）。
+# 现在年度、季度分别选标签，并且拿这家公司所有指标里最新的那个期末日期做参照：
+# 比参照日期早太多的"最新一期"判定为过时，不返回，在notes里说明原因——宁可
+# 告诉Agent"这项数据没有"，也不能让它拿到一个看起来正常的陈旧数字。
+# 阈值留了余量：年报一年一次，最新年报期末可以比最新季报期末早将近一年；季报
+# 允许落后一个季度（财年第四季度只出现在10-K里、没有单独的单季度数据）。
+ANNUAL_STALE_DAYS = 550
+QUARTERLY_STALE_DAYS = 200
 
+
+def _select_series(
+    us_gaap: dict, tag_candidates: list[str], kind: str
+) -> tuple[str, str, list[dict]] | None:
+    """从候选标签里，为年度（kind="annual"）或季度（kind="quarterly"）数据各自选出
+    最新一期最靠后的那个标签，返回 (tag, unit_name, points)。points按end倒序。
+    年度和季度分开选，避免一个标签"年度数据新、季度数据早就停了"时把旧季度
+    数据带出来。所有候选标签都没有这类数据时返回 None。"""
+    best: tuple[str, str, list[dict]] | None = None
     for tag in tag_candidates:
         tag_data = us_gaap.get(tag)
         if not tag_data:
@@ -313,34 +325,33 @@ def _select_best_tag_points(
         unit_name = "USD" if "USD" in units else next(iter(units), None)
         if unit_name is None:
             continue
-
         points = _parse_points(units[unit_name])
-        if not points:
-            continue
-
         # 同一个 end 日期下，10-Q/10-K/20-F 里常常混着单季度、累计9个月、整年等多种口径
         # 的重复披露（start 不同），必须按 start~end 的实际跨度分开挑，不能只看 form+end。
-        annual_points = _dedupe_by_end(
-            [p for p in points if p["form"] in ANNUAL_FORMS and _is_full_year(p)]
-        )
-        quarterly_points = _dedupe_by_end(
-            [p for p in points if p["form"] in QUARTERLY_FORMS and _is_single_quarter(p)]
-        )
-        if not annual_points and not quarterly_points:
-            continue
+        if kind == "annual":
+            series = _dedupe_by_end([p for p in points if p["form"] in ANNUAL_FORMS and _is_full_year(p)])
+        else:
+            series = _dedupe_by_end([p for p in points if p["form"] in QUARTERLY_FORMS and _is_single_quarter(p)])
+        if series and (best is None or series[0]["end"] > best[2][0]["end"]):
+            best = (tag, unit_name, series)
+    return best
 
-        candidate_latest_end = max((p["end"] for p in annual_points + quarterly_points), default="")
-        if candidate_latest_end > best_latest_end:
-            best_tag = tag
-            best_unit_name = unit_name
-            best_annual_points = annual_points
-            best_quarterly_points = quarterly_points
-            best_latest_end = candidate_latest_end
 
-    if best_tag is None:
-        return None
-    assert best_unit_name is not None  # 跟 best_tag 在同一个分支里一起赋值，不会只有一个是None
-    return best_tag, best_unit_name, best_annual_points, best_quarterly_points
+def _days_between(later: str, earlier: str) -> int:
+    return (datetime.fromisoformat(later) - datetime.fromisoformat(earlier)).days
+
+
+def _reference_end(selections: dict[str, dict[str, tuple[str, str, list[dict]] | None]]) -> str:
+    """这家公司所有指标、年度和季度里最新的那个期末日期——判断某一项是否过时的参照。"""
+    ends = [sel[2][0]["end"] for per_metric in selections.values() for sel in per_metric.values() if sel]
+    return max(ends, default="")
+
+
+def _is_stale(point_end: str, reference_end: str, kind: str) -> bool:
+    if not reference_end:
+        return False
+    limit = ANNUAL_STALE_DAYS if kind == "annual" else QUARTERLY_STALE_DAYS
+    return _days_between(reference_end, point_end) > limit
 
 
 def _build_history_points(annual_points: list[dict], years: int) -> list[MetricPoint]:
@@ -363,12 +374,17 @@ def extract_metrics_history(facts_json: dict, years: int = HISTORY_YEARS) -> dic
     history: dict[str, MetricHistory] = {}
     raw_annual: dict[str, list[dict]] = {}
 
-    for metric_key, tag_candidates in METRIC_TAGS.items():
-        selected = _select_best_tag_points(us_gaap, tag_candidates)
+    selections = {key: {"annual": _select_series(us_gaap, tags, "annual")} for key, tags in METRIC_TAGS.items()}
+    reference_end = _reference_end(selections)
+
+    for metric_key, per_metric in selections.items():
+        selected = per_metric["annual"]
         if selected is None:
             continue
-        _tag, unit_name, annual_points, _quarterly_points = selected
-        if not annual_points:
+        _tag, unit_name, annual_points = selected
+        # 整个标签早已停用（最新一年都过时了）——多年趋势图里画一段十几年前的
+        # 序列只会误导，直接不展示
+        if _is_stale(annual_points[0]["end"], reference_end, "annual"):
             continue
 
         raw_annual[metric_key] = annual_points
@@ -411,33 +427,59 @@ def extract_key_metrics(facts_json: dict) -> dict[str, FinancialMetric]:
     metrics: dict[str, FinancialMetric] = {}
     raw_points: dict[str, tuple[list[dict], list[dict]]] = {}
 
-    for metric_key, tag_candidates in METRIC_TAGS.items():
-        selected = _select_best_tag_points(us_gaap, tag_candidates)
-        if selected is None:
+    selections = {
+        key: {"annual": _select_series(us_gaap, tags, "annual"), "quarterly": _select_series(us_gaap, tags, "quarterly")}
+        for key, tags in METRIC_TAGS.items()
+    }
+    reference_end = _reference_end(selections)
+
+    for metric_key, per_metric in selections.items():
+        annual_sel, quarterly_sel = per_metric["annual"], per_metric["quarterly"]
+        if annual_sel is None and quarterly_sel is None:
             continue
-        best_tag, best_unit_name, best_annual_points, best_quarterly_points = selected
+        notes: list[str] = []
+        annual_points: list[dict] = []
+        quarterly_points: list[dict] = []
+        if annual_sel is not None:
+            if _is_stale(annual_sel[2][0]["end"], reference_end, "annual"):
+                notes.append(
+                    f"年度数据的最新一期停留在 {annual_sel[2][0]['end']}，比这家公司最新一期数据早太多（标签 {annual_sel[0]} "
+                    "可能已停用），判定为过时数据，不予返回"
+                )
+            else:
+                annual_points = annual_sel[2]
+        if quarterly_sel is not None:
+            if _is_stale(quarterly_sel[2][0]["end"], reference_end, "quarterly"):
+                notes.append(
+                    f"单季度数据的最新一期停留在 {quarterly_sel[2][0]['end']}，比这家公司最新一期数据早太多（标签 {quarterly_sel[0]} "
+                    "可能已停用，或这项数据只按年初至今累计口径披露），判定为过时数据，不予返回"
+                )
+            else:
+                quarterly_points = quarterly_sel[2]
 
-        raw_points[metric_key] = (best_annual_points, best_quarterly_points)
-
-        latest_annual_raw = best_annual_points[0] if best_annual_points else None
-        latest_quarterly_raw = best_quarterly_points[0] if best_quarterly_points else None
+        raw_points[metric_key] = (annual_points, quarterly_points)
 
         latest_annual = None
-        if latest_annual_raw is not None:
-            yoy = _find_yoy_point(best_annual_points, latest_annual_raw["end"], ANNUAL_FORMS)
-            latest_annual = _build_metric_point(latest_annual_raw, yoy)
+        if annual_points:
+            yoy = _find_yoy_point(annual_points, annual_points[0]["end"], ANNUAL_FORMS)
+            latest_annual = _build_metric_point(annual_points[0], yoy)
 
         latest_quarterly = None
-        if latest_quarterly_raw is not None:
-            yoy = _find_yoy_point(best_quarterly_points, latest_quarterly_raw["end"], QUARTERLY_FORMS)
-            latest_quarterly = _build_metric_point(latest_quarterly_raw, yoy)
+        if quarterly_points:
+            yoy = _find_yoy_point(quarterly_points, quarterly_points[0]["end"], QUARTERLY_FORMS)
+            latest_quarterly = _build_metric_point(quarterly_points[0], yoy)
 
+        primary = annual_sel or quarterly_sel
+        assert primary is not None  # 上面已经排除了两者都是None的情况
+        quarterly_tag = quarterly_sel[0] if quarterly_sel is not None and quarterly_sel[0] != primary[0] else None
         metrics[metric_key] = FinancialMetric(
-            tag=best_tag,
+            tag=primary[0],
+            quarterly_tag=quarterly_tag,
             label=METRIC_LABELS[metric_key],
-            unit=best_unit_name,
+            unit=primary[1],
             latest_annual=latest_annual,
             latest_quarterly=latest_quarterly,
+            notes=notes,
         )
 
     _add_free_cash_flow(metrics, raw_points)

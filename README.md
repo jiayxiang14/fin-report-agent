@@ -255,6 +255,7 @@ Required env vars (see `backend/.env.example`):
 | `SEC_EDGAR_USER_AGENT` | Required by SEC EDGAR — format: `"Your Name your_email@example.com"` |
 | `POLYGON_API_KEY` | Market/sector data |
 | `ALPHA_VANTAGE_API_KEY` | Analyst EPS estimates for `get_earnings_surprise` — optional, tool soft-degrades (`has_data: false`) without it |
+| `ENABLE_CACHE_WARMING` | `true` (default) — background task that keeps the sector/thematic ETF quote cache warm so it doesn't cold-start behind Polygon's rate limit; set `false` to disable |
 
 ### Frontend
 

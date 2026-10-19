@@ -38,7 +38,7 @@ def _start(ticker: str = "AAPL") -> str:
 
 
 def test_stream_route_emits_progress_events_then_done():
-    async def fake_run_agent_loop(ticker, max_turns=8, on_event=None, on_tool_result=None):
+    async def fake_run_agent_loop(ticker, on_event=None, on_tool_result=None, **_kwargs):
         if on_event:
             await on_event({"type": "reasoning", "turn": 0, "text": "先查财务数据"})
             await on_event(
@@ -68,7 +68,7 @@ def test_stream_route_emits_progress_events_then_done():
             turns_used=1,
         )
 
-    with patch("app.api.routes.agent.run_agent_loop", new=fake_run_agent_loop):
+    with patch("app.services.agent.task_runner.run_agent_loop", new=fake_run_agent_loop):
         task_id = _start()
         response = client.get(f"/api/analyze/stream/{task_id}")
 
@@ -83,16 +83,19 @@ def test_stream_route_emits_progress_events_then_done():
 
 
 def test_stream_route_emits_error_event_on_exception():
-    async def fake_run_agent_loop(ticker, max_turns=8, on_event=None, on_tool_result=None):
+    async def fake_run_agent_loop(ticker, on_event=None, on_tool_result=None, **_kwargs):
         raise RuntimeError("LLM 调用失败")
 
-    with patch("app.api.routes.agent.run_agent_loop", new=fake_run_agent_loop):
+    with patch("app.services.agent.task_runner.run_agent_loop", new=fake_run_agent_loop):
         task_id = _start()
         response = client.get(f"/api/analyze/stream/{task_id}")
 
     assert response.status_code == 200  # SSE已经开始推流，状态码只能是200
     events = _parse_sse_events(response.text)
-    assert events == [{"type": "error", "message": "LLM 调用失败"}]
+    assert len(events) == 1
+    assert events[0]["type"] == "error"
+    assert events[0]["message"] == "LLM 调用失败"
+    assert isinstance(events[0]["elapsed_ms"], int)
 
 
 def test_stream_route_returns_error_event_for_unknown_task_id():
@@ -115,7 +118,7 @@ def test_start_persists_full_untruncated_tool_output_via_trace_log(tmp_path):
     跟task_registry落的那份summary共用同一个trace_id文件。"""
     long_output = "x" * 500  # 明显超过SUMMARY_LENGTH=300，确认没有被截断
 
-    async def fake_run_agent_loop(ticker, max_turns=8, on_event=None, on_tool_result=None):
+    async def fake_run_agent_loop(ticker, on_event=None, on_tool_result=None, **_kwargs):
         if on_tool_result:
             await on_tool_result("get_financials", long_output)
         return AgentRunResult(
@@ -129,7 +132,7 @@ def test_start_persists_full_untruncated_tool_output_via_trace_log(tmp_path):
         )
 
     with (
-        patch("app.api.routes.agent.run_agent_loop", new=fake_run_agent_loop),
+        patch("app.services.agent.task_runner.run_agent_loop", new=fake_run_agent_loop),
         patch.object(trace_log, "TRACE_DIR", tmp_path),
     ):
         task_id = _start()
@@ -156,7 +159,7 @@ def test_second_start_with_same_session_id_is_rejected_while_first_is_in_flight(
     monkeypatch.setattr("app.api.session_guard._in_flight_sessions", set())
     still_running = asyncio.Event()
 
-    async def fake_run_agent_loop(ticker, max_turns=8, on_event=None, on_tool_result=None):
+    async def fake_run_agent_loop(ticker, on_event=None, on_tool_result=None, **_kwargs):
         await still_running.wait()
         return AgentRunResult(
             ticker=ticker,
@@ -178,7 +181,7 @@ def test_second_start_with_same_session_id_is_rejected_while_first_is_in_flight(
             await asyncio.sleep(0)
             return first, second
 
-    with patch("app.api.routes.agent.run_agent_loop", new=fake_run_agent_loop):
+    with patch("app.services.agent.task_runner.run_agent_loop", new=fake_run_agent_loop):
         first, second = asyncio.run(run())
 
     assert first.status_code == 200
@@ -189,7 +192,7 @@ def test_second_start_with_same_session_id_is_rejected_while_first_is_in_flight(
 def test_session_is_released_once_the_background_analysis_completes(monkeypatch):
     monkeypatch.setattr("app.api.session_guard._in_flight_sessions", set())
 
-    async def fake_run_agent_loop(ticker, max_turns=8, on_event=None, on_tool_result=None):
+    async def fake_run_agent_loop(ticker, on_event=None, on_tool_result=None, **_kwargs):
         return AgentRunResult(
             ticker=ticker,
             completed=True,
@@ -200,7 +203,7 @@ def test_session_is_released_once_the_background_analysis_completes(monkeypatch)
             turns_used=1,
         )
 
-    with patch("app.api.routes.agent.run_agent_loop", new=fake_run_agent_loop):
+    with patch("app.services.agent.task_runner.run_agent_loop", new=fake_run_agent_loop):
         first = client.post("/api/analyze/AAPL/start", headers={"X-Session-Id": "shared-session-2"})
         # 完整拉一次stream，确保后台task真的跑完了（_replay_and_tail只有在
         # state.done之后才会让生成器结束，TestClient.get()会等生成器耗尽）
@@ -215,7 +218,7 @@ def test_session_is_released_once_the_background_analysis_completes(monkeypatch)
 def test_start_without_a_session_id_header_is_never_blocked(monkeypatch):
     monkeypatch.setattr("app.api.session_guard._in_flight_sessions", set())
 
-    async def fake_run_agent_loop(ticker, max_turns=8, on_event=None, on_tool_result=None):
+    async def fake_run_agent_loop(ticker, on_event=None, on_tool_result=None, **_kwargs):
         return AgentRunResult(
             ticker=ticker,
             completed=True,
@@ -226,7 +229,7 @@ def test_start_without_a_session_id_header_is_never_blocked(monkeypatch):
             turns_used=1,
         )
 
-    with patch("app.api.routes.agent.run_agent_loop", new=fake_run_agent_loop):
+    with patch("app.services.agent.task_runner.run_agent_loop", new=fake_run_agent_loop):
         first = client.post("/api/analyze/AAPL/start")
         second = client.post("/api/analyze/MSFT/start")
 
@@ -240,7 +243,7 @@ def test_reconnecting_after_completion_replays_full_history():
     events是按task持久保留的（进程内，不因为没人订阅就清空），第二次订阅
     应该能收到完整的历史事件，不是空的。"""
 
-    async def fake_run_agent_loop(ticker, max_turns=8, on_event=None, on_tool_result=None):
+    async def fake_run_agent_loop(ticker, on_event=None, on_tool_result=None, **_kwargs):
         if on_event:
             await on_event({"type": "reasoning", "turn": 0, "text": "推理中"})
         return AgentRunResult(
@@ -253,7 +256,7 @@ def test_reconnecting_after_completion_replays_full_history():
             turns_used=1,
         )
 
-    with patch("app.api.routes.agent.run_agent_loop", new=fake_run_agent_loop):
+    with patch("app.services.agent.task_runner.run_agent_loop", new=fake_run_agent_loop):
         task_id = _start()
         first = client.get(f"/api/analyze/stream/{task_id}")
         second = client.get(f"/api/analyze/stream/{task_id}")

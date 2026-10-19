@@ -8,7 +8,7 @@
 import asyncio
 from unittest.mock import AsyncMock, patch
 
-from app.services.agent.llm_client import LLMResponse, ToolCall
+from app.services.agent.llm_client import LLMResponse, LLMUsage, ToolCall
 from app.services.agent.loop import run_agent_loop
 
 
@@ -17,11 +17,19 @@ class FakeLLMClient:
         self._responses = list(responses)
         self.calls = 0
         self.received_temperatures: list[float | None] = []
+        # 真实流式场景下 on_text_delta 会在每次响应文字到齐之前收到若干增量——
+        # 这里简化成"每条响应的完整text，原样当一个delta回调一次"，不模拟真的
+        # 逐字符切分（那是 test_llm_client.py 该测的传输层细节，这里只关心
+        # loop.py 有没有把回调正确接进 create_message、有没有正确转发成
+        # reasoning_delta 事件）
+        self.emit_deltas = False
 
-    async def create_message(self, system, messages, tools, temperature=None):
+    async def create_message(self, system, messages, tools, temperature=None, on_text_delta=None):
         self.received_temperatures.append(temperature)
         response = self._responses[self.calls]
         self.calls += 1
+        if self.emit_deltas and on_text_delta is not None and response.text:
+            await on_text_delta(response.text)
         return response
 
     def append_assistant_turn(self, messages, response):
@@ -137,12 +145,21 @@ def test_on_event_fires_in_expected_order_for_reasoning_and_tool_calls():
     # 第二轮 end_turn 触发自我核查兜底（还没调用过verify_number），插入nudge后
     # 再走一轮才真正结束，每一轮只要有文字都会触发一次 reasoning 事件，一共5个
     event_types = [e["type"] for e in events]
-    assert event_types == ["reasoning", "tool_call_started", "tool_call_finished", "reasoning", "reasoning"]
-    assert events[0]["text"] == "先查一下财务数据"
-    assert events[1]["tool_name"] == "get_financials"
+    assert event_types == [
+        "llm_usage",
+        "reasoning",
+        "tool_call_started",
+        "tool_call_finished",
+        "llm_usage",
+        "reasoning",
+        "llm_usage",
+        "reasoning",
+    ]
+    assert events[1]["text"] == "先查一下财务数据"
     assert events[2]["tool_name"] == "get_financials"
-    assert events[2]["is_error"] is False
-    assert events[3]["text"] == "<conclusion>...</conclusion><evidence>...</evidence><flags>...</flags>"
+    assert events[3]["tool_name"] == "get_financials"
+    assert events[3]["is_error"] is False
+    assert events[5]["text"] == "<conclusion>...</conclusion><evidence>...</evidence><flags>...</flags>"
 
 
 def test_final_report_falls_back_to_earlier_tagged_draft_when_last_turn_has_no_tags():
@@ -361,3 +378,82 @@ def test_traceable_numbers_default_to_zero_when_no_numeric_claims():
 
     assert result.traceable_numbers_matched == 0
     assert result.traceable_numbers_total == 0
+
+
+def test_token_usage_accumulates_across_turns_and_estimates_cost():
+    # verify_number 没被调用过，第一次 end_turn 会被自我核查gate拦一次要求补
+    # （见 test_self_verification_nudge.py），所以需要3轮才能真正收尾，不是2轮
+    tagged_report = "<conclusion>...</conclusion><evidence>...</evidence><flags>...</flags>"
+    responses = [
+        LLMResponse(
+            stop_reason="tool_use",
+            text=None,
+            tool_calls=[ToolCall(id="1", name="get_financials", input={"ticker": "AAPL"})],
+            raw=None,
+            model="claude-sonnet-5",
+            usage=LLMUsage(input_tokens=1000, output_tokens=100, cache_creation_input_tokens=50, cache_read_input_tokens=0),
+        ),
+        LLMResponse(
+            stop_reason="end_turn",
+            text=tagged_report,
+            tool_calls=[],
+            raw=None,
+            model="claude-sonnet-5",
+            usage=LLMUsage(input_tokens=2000, output_tokens=200, cache_creation_input_tokens=0, cache_read_input_tokens=1000),
+        ),
+        LLMResponse(
+            stop_reason="end_turn",
+            text=tagged_report,
+            tool_calls=[],
+            raw=None,
+            model="claude-sonnet-5",
+            usage=LLMUsage(input_tokens=3000, output_tokens=300, cache_creation_input_tokens=0, cache_read_input_tokens=1500),
+        ),
+    ]
+    fake = FakeLLMClient(responses)
+    with (
+        patch("app.services.agent.loop.get_llm_client", return_value=fake),
+        patch("app.services.agent.loop.execute_tool", new=AsyncMock(return_value=("{}", False))),
+    ):
+        result = asyncio.run(run_agent_loop("AAPL"))
+
+    assert fake.calls == 3
+    assert result.total_input_tokens == sum(r.usage.input_tokens for r in fake._responses[: fake.calls])
+    assert result.total_output_tokens == sum(r.usage.output_tokens for r in fake._responses[: fake.calls])
+    assert result.total_cache_creation_input_tokens == sum(
+        r.usage.cache_creation_input_tokens for r in fake._responses[: fake.calls]
+    )
+    assert result.total_cache_read_input_tokens == sum(
+        r.usage.cache_read_input_tokens for r in fake._responses[: fake.calls]
+    )
+    # claude-sonnet-5 在价格表里，成本应该是个真实算出来的正数，不是None/0
+    assert result.estimated_cost_usd is not None
+    assert result.estimated_cost_usd > 0
+
+
+def test_unknown_model_leaves_estimated_cost_as_none():
+    responses = [LLMResponse(stop_reason="end_turn", text="最终简报，无数字", tool_calls=[], raw=None, model="some-future-model")]
+    fake = FakeLLMClient(responses)
+    with patch("app.services.agent.loop.get_llm_client", return_value=fake):
+        result = asyncio.run(run_agent_loop("AAPL"))
+
+    assert result.estimated_cost_usd is None
+
+
+def test_on_text_delta_is_forwarded_as_reasoning_delta_events():
+    """loop.py 把自己包的 on_text_delta 回调传给 create_message，供应商侧真的
+    产出增量时应该原样转发成 SSE 的 reasoning_delta 事件，带上正确的 turn 号——
+    跟 reasoning 事件（完整文字、这一轮结束后才发一次）是两回事，不互相替代。"""
+    responses = [LLMResponse(stop_reason="end_turn", text="最终简报，无数字", tool_calls=[], raw=None)]
+    fake = FakeLLMClient(responses)
+    fake.emit_deltas = True
+    events: list[dict] = []
+
+    async def on_event(event: dict) -> None:
+        events.append(event)
+
+    with patch("app.services.agent.loop.get_llm_client", return_value=fake):
+        asyncio.run(run_agent_loop("AAPL", on_event=on_event))
+
+    delta_events = [e for e in events if e["type"] == "reasoning_delta"]
+    assert delta_events == [{"type": "reasoning_delta", "turn": 0, "text": "最终简报，无数字"}]

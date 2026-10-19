@@ -13,13 +13,16 @@ DeepSeek 提供了 Anthropic 格式兼容的端点（`base_url` 指向
 """
 
 import asyncio
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import cast
 
 import anthropic
 from anthropic.types import Message
 
 from app.core.config import settings
+
+OnTextDelta = Callable[[str], Awaitable[None]]
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
 DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash"
@@ -67,6 +70,25 @@ class ToolResult:
     tool_call_id: str
     content: str
     is_error: bool = False
+    # 调用方（loop.py）知道这条结果下一轮会不会被上下文压缩替换成占位符——
+    # 会被替换的不该打cache_control：缓存写入要多付25%，而写进去的内容
+    # 下一轮就被换掉、几乎没机会被读取，溢价白付（真实trace量化过：每读
+    # 一份约10万token的财报原文，按Claude Sonnet价格多花约$0.07）
+    cacheable: bool = True
+
+
+@dataclass
+class LLMUsage:
+    """token用量，直接来自API响应的`usage`字段（确定性数字，不是估算）——
+    `cache_creation_input_tokens`/`cache_read_input_tokens`只有真正命中/写入
+    prompt cache时才非零，DeepSeek侧目前没开`cache_control`（见下方
+    `use_cache_control=False`），这两个字段对DeepSeek请求恒为0，不代表没有
+    自动前缀缓存，只是这个信号API不回传。"""
+
+    input_tokens: int
+    output_tokens: int
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
 
 
 @dataclass
@@ -75,6 +97,9 @@ class LLMResponse:
     text: str | None
     tool_calls: list[ToolCall]
     raw: Message  # 原始响应对象，append_assistant_turn 靠它把上一轮回复原样喂回下一轮 messages
+    # 新增两个字段都给了默认值，保证测试里手写的 LLMResponse(...) 不用跟着改
+    model: str = ""
+    usage: LLMUsage = field(default_factory=lambda: LLMUsage(0, 0))
 
 
 class AnthropicCompatibleClient:
@@ -99,7 +124,15 @@ class AnthropicCompatibleClient:
         messages: list[dict],
         tools: list[dict],
         temperature: float | None = None,
+        on_text_delta: OnTextDelta | None = None,
+        max_tokens: int | None = None,
+        effort: str | None = None,
     ) -> LLMResponse:
+        """内部统一走流式请求（`messages.stream`），不管调用方要不要token级
+        增量——这样只维护一条请求路径，不用在"流式"和"非流式"两套实现之间
+        保证行为一致。`on_text_delta`留空时，流照样开、事件照样迭代，只是没人
+        读每次的delta，最终拿到的`get_final_message()`结果跟原来`create()`
+        返回的Message等价，下面的解析逻辑不用区分是不是流式拿到的。"""
         system_param: str | list[dict]
         if self._use_cache_control:
             system_param = [
@@ -110,7 +143,9 @@ class AnthropicCompatibleClient:
 
         kwargs: dict = {
             "model": self._model,
-            "max_tokens": MAX_TOKENS,
+            # 默认值对Agent Loop够用；会先输出很长thinking的强模型（deepseek-v4-pro做
+            # 审阅/评分时）要单独调大——实测过8192被thinking用光、正文一个字没写就截断
+            "max_tokens": max_tokens or MAX_TOKENS,
             "system": system_param,
             "messages": messages,
             "tools": tools,
@@ -119,8 +154,13 @@ class AnthropicCompatibleClient:
         # Best-of-N之前所有调用方（单次Agent Loop）已验证过的行为
         if temperature is not None:
             kwargs["temperature"] = temperature
+        # 推理强度（low/high/max）。deepseek-v4-pro默认high，审阅一份简报会先输出
+        # 约2万token的thinking、耗时5分钟；实测low把输出降到约5千、耗时约1分钟，
+        # 审阅意见仍然有实质内容。只在显式传入时才发送
+        if effort is not None:
+            kwargs["extra_body"] = {"output_config": {"effort": effort}}
 
-        response = await self._create_with_connection_retry(kwargs)
+        response = await self._create_with_connection_retry(kwargs, on_text_delta)
 
         text_blocks = [block.text for block in response.content if block.type == "text"]
         text = "\n".join(text_blocks) if text_blocks else None
@@ -130,13 +170,25 @@ class AnthropicCompatibleClient:
             if block.type == "tool_use"
         ]
         stop_reason = _STOP_REASON_MAP.get(response.stop_reason, "error") if response.stop_reason else "error"
+        usage = LLMUsage(
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            cache_creation_input_tokens=response.usage.cache_creation_input_tokens or 0,
+            cache_read_input_tokens=response.usage.cache_read_input_tokens or 0,
+        )
 
-        return LLMResponse(stop_reason=stop_reason, text=text, tool_calls=tool_calls, raw=response)
+        return LLMResponse(
+            stop_reason=stop_reason, text=text, tool_calls=tool_calls, raw=response, model=self._model, usage=usage
+        )
 
-    async def _create_with_connection_retry(self, kwargs: dict) -> Message:
+    async def _create_with_connection_retry(self, kwargs: dict, on_text_delta: OnTextDelta | None) -> Message:
         for attempt in range(CONNECTION_RETRY_ATTEMPTS + 1):
             try:
-                return cast(Message, await self._client.messages.create(**kwargs))
+                async with self._client.messages.stream(**kwargs) as stream:
+                    async for event in stream:
+                        if on_text_delta is not None and event.type == "text":
+                            await on_text_delta(event.text)
+                    return cast(Message, await stream.get_final_message())
             except (anthropic.APITimeoutError, anthropic.APIConnectionError):
                 if attempt == CONNECTION_RETRY_ATTEMPTS:
                     raise
@@ -157,29 +209,33 @@ class AnthropicCompatibleClient:
                 "content": result.content,
                 "is_error": result.is_error,
             }
-            if self._use_cache_control and len(result.content) > CACHEABLE_CONTENT_THRESHOLD:
+            if self._use_cache_control and result.cacheable and len(result.content) > CACHEABLE_CONTENT_THRESHOLD:
                 block["cache_control"] = {"type": "ephemeral"}
             content.append(block)
         return [*messages, {"role": "user", "content": content}]
 
 
-def get_llm_client(provider: str | None = None) -> AnthropicCompatibleClient:
+def get_llm_client(provider: str | None = None, model: str | None = None) -> AnthropicCompatibleClient:
     """`provider`留空时用`settings.llm_provider`（现有行为不变）。传具体值时
-    覆盖——目前唯一的调用场景是`reward.py`的LLM裁判可选择走跟生成报告不同的
-    供应商，减少"用同一个模型评自己生成的内容"这种自评偏好嫌疑。"""
+    覆盖——调用场景是`reward.py`的LLM裁判可选择走跟生成报告不同的供应商，减少
+    "用同一个模型评自己生成的内容"这种自评偏好嫌疑。
+
+    `model`覆盖该供应商的默认模型（优先级高于`LLM_MODEL`）：同一供应商内部做
+    角色隔离时用，比如"草稿+审阅"里审阅者用更强的deepseek-v4-pro、写草稿仍用
+    默认的flash。"""
     resolved_provider = provider or settings.llm_provider
     if resolved_provider == "claude":
         return AnthropicCompatibleClient(
             base_url=CLAUDE_BASE_URL,
             api_key=settings.anthropic_api_key,
-            model=settings.llm_model or CLAUDE_DEFAULT_MODEL,
+            model=model or settings.llm_model or CLAUDE_DEFAULT_MODEL,
             use_cache_control=True,
         )
     if resolved_provider == "deepseek":
         return AnthropicCompatibleClient(
             base_url=DEEPSEEK_BASE_URL,
             api_key=settings.deepseek_api_key,
-            model=settings.llm_model or DEEPSEEK_DEFAULT_MODEL,
+            model=model or settings.llm_model or DEEPSEEK_DEFAULT_MODEL,
             # DeepSeek 是自动前缀缓存，不需要/未验证是否接受 cache_control 字段，先不发送
             use_cache_control=False,
         )

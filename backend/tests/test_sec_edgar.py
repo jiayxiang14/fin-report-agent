@@ -382,3 +382,85 @@ def test_falls_back_to_non_usd_unit_when_usd_not_disclosed():
 
     assert metrics["revenue"].unit == "EUR"
     assert metrics["revenue"].latest_annual.val == 500_000_000
+
+
+def test_annual_and_quarterly_series_are_selected_from_different_tags_independently():
+    """真实踩过的坑（JPM）：Revenues标签的年度数据更新到2025、单季度数据停在2014。
+    原来把年度和季度混在一起比"最新日期"选一个标签，结果把2014年Q3当成了最新一季。"""
+    facts_json = _facts_json(
+        {
+            "Revenues": [
+                _point("2025-12-31", "10-K", "2026-02-15", 180e9, start="2025-01-01", fy=2025, fp="FY"),
+                _point("2014-09-30", "10-Q", "2014-11-01", 24.2e9, start="2014-07-01", fy=2014, fp="Q3"),
+            ],
+            "RevenuesNetOfInterestExpense": [
+                _point("2026-06-30", "10-Q", "2026-08-01", 48e9, start="2026-04-01", fy=2026, fp="Q2"),
+                _point("2025-06-30", "10-Q", "2025-08-01", 45e9, start="2025-04-01", fy=2025, fp="Q2"),
+            ],
+        }
+    )
+
+    revenue = extract_key_metrics(facts_json)["revenue"]
+
+    assert revenue.tag == "Revenues"
+    assert revenue.latest_annual.end == "2025-12-31"
+    assert revenue.quarterly_tag == "RevenuesNetOfInterestExpense"
+    assert revenue.latest_quarterly.end == "2026-06-30"
+    assert revenue.latest_quarterly.yoy_change_pct == round((48 - 45) / 45 * 100, 2)
+    assert revenue.notes == []
+
+
+def test_long_discontinued_tag_is_reported_as_stale_instead_of_returned_as_latest():
+    """真实踩过的坑（KO/WMT）：EarningsPerShareDiluted标签2009年后停用，旧代码照样
+    把2009年的值当成"最新一季"返回，公司概况的市盈率也是拿它算的。"""
+    facts_json = _facts_json(
+        {
+            "Revenues": [
+                _point("2026-04-03", "10-Q", "2026-04-30", 12.4e9, start="2026-01-01", fy=2026, fp="Q1"),
+                _point("2025-12-31", "10-K", "2026-02-20", 47.9e9, start="2025-01-01", fy=2025, fp="FY"),
+            ],
+            "EarningsPerShareDiluted": [
+                _point("2009-07-03", "10-Q", "2009-07-30", 0.88, start="2009-04-04", fy=2009, fp="Q2"),
+            ],
+        }
+    )
+
+    metrics = extract_key_metrics(facts_json)
+
+    eps = metrics["eps_diluted"]
+    assert eps.latest_quarterly is None
+    assert len(eps.notes) == 1
+    assert "2009-07-03" in eps.notes[0] and "过时" in eps.notes[0]
+    assert metrics["revenue"].latest_quarterly.end == "2026-04-03"  # 正常数据不受影响
+
+
+def test_one_quarter_lag_is_not_treated_as_stale():
+    """财年第四季度只出现在10-K里、没有单独的单季度数据（MSFT/MU），最新一季会
+    比最新年报落后一个季度——这是正常的，不能被误判成过时。"""
+    facts_json = _facts_json(
+        {
+            "Revenues": [
+                _point("2026-06-30", "10-K", "2026-07-30", 300e9, start="2025-07-01", fy=2026, fp="FY"),
+                _point("2026-03-31", "10-Q", "2026-04-30", 77e9, start="2026-01-01", fy=2026, fp="Q3"),
+            ],
+        }
+    )
+
+    revenue = extract_key_metrics(facts_json)["revenue"]
+
+    assert revenue.latest_quarterly.end == "2026-03-31"
+    assert revenue.notes == []
+
+
+def test_history_skips_metrics_whose_whole_annual_series_is_stale():
+    facts_json = _facts_json(
+        {
+            "Revenues": [_point("2025-12-31", "10-K", "2026-02-20", 47.9e9, start="2025-01-01", fy=2025, fp="FY")],
+            "EarningsPerShareDiluted": [_point("2008-12-31", "10-K", "2009-02-20", 2.5, start="2008-01-01", fy=2008, fp="FY")],
+        }
+    )
+
+    history = extract_metrics_history(facts_json)
+
+    assert "revenue" in history
+    assert "eps_diluted" not in history

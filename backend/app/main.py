@@ -1,3 +1,7 @@
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -14,9 +18,24 @@ from app.api.routes import (
     thematic_flow,
     trace,
 )
+from app.core.config import settings
+from app.services import cache_warmer, task_recovery
 from app.services.sec_client import SecClientError
 
-app = FastAPI(title="US Equity Research Agent API")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    if settings.enable_task_recovery:
+        task_recovery.recover_pending_tasks()
+    warmer_task = asyncio.create_task(cache_warmer.run_periodic_cache_warming()) if settings.enable_cache_warming else None
+    try:
+        yield
+    finally:
+        if warmer_task is not None:
+            warmer_task.cancel()
+
+
+app = FastAPI(title="US Equity Research Agent API", lifespan=lifespan)
 
 
 @app.exception_handler(SecClientError)

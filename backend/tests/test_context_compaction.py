@@ -171,7 +171,7 @@ class _FaithfulFakeLLMClient:
         self.calls = 0
         self.received_messages: list[list[dict]] = []
 
-    async def create_message(self, system, messages, tools, temperature=None):
+    async def create_message(self, system, messages, tools, temperature=None, on_text_delta=None):
         self.received_messages.append(messages)
         response = self._responses[self.calls]
         self.calls += 1
@@ -355,3 +355,50 @@ def test_compaction_writes_audit_log_entries(tmp_path, monkeypatch):
     assert record["ticker"] == "AMD"
     assert record["tool_name"] == "get_filing_text"
     assert record["original_length"] == len(huge_filing_text)
+
+
+def _run_and_capture_cacheable_flags(enable_compaction: bool) -> dict[str, bool]:
+    captured: dict[str, bool] = {}
+
+    class RecordingLLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def create_message(self, system, messages, tools, temperature=None, on_text_delta=None):
+            self.calls += 1
+            if self.calls == 1:
+                return LLMResponse(
+                    stop_reason="tool_use",
+                    text=None,
+                    tool_calls=[
+                        ToolCall(id="f", name="get_filing_text", input={"ticker": "AAPL"}),
+                        ToolCall(id="n", name="get_financials", input={"ticker": "AAPL"}),
+                    ],
+                    raw=None,
+                )
+            return LLMResponse(stop_reason="refusal", text=None, tool_calls=[], raw=None)
+
+        def append_assistant_turn(self, messages, response):
+            return [*messages, {"role": "assistant", "content": "x"}]
+
+        def append_tool_results(self, messages, tool_calls, results):
+            for result in results:
+                captured[result.tool_call_id] = result.cacheable
+            return [*messages, {"role": "user", "content": "x"}]
+
+    with (
+        mock.patch("app.services.agent.loop.get_llm_client", return_value=RecordingLLM()),
+        mock.patch("app.services.agent.loop.execute_tool", new=mock.AsyncMock(return_value=("y" * 6000, False))),
+    ):
+        asyncio.run(run_agent_loop("AAPL", enable_compaction=enable_compaction))
+    return captured
+
+
+def test_results_that_will_be_compacted_are_not_marked_cacheable():
+    flags = _run_and_capture_cacheable_flags(enable_compaction=True)
+    assert flags == {"f": False, "n": True}  # get_financials 豁免压缩，照常缓存
+
+
+def test_all_results_stay_cacheable_when_compaction_is_off():
+    flags = _run_and_capture_cacheable_flags(enable_compaction=False)
+    assert flags == {"f": True, "n": True}

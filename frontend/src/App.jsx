@@ -109,7 +109,16 @@ function App() {
   const activeResult = isDeep ? (bestOfN.result ? bestOfN.result.selected : null) : agent.result
   const activeStreamError = isDeep ? bestOfN.streamError : agent.streamError
   const activeDone = isDeep ? bestOfN.done : agent.done
+  const activeCancelled = isDeep ? bestOfN.cancelled : agent.cancelled
+  const activeOnCancel = isDeep ? bestOfN.cancel : agent.cancel
+  // 只有普通分析存检查点，深度分析失败不提供断点重试
+  const activeRetryable = isDeep ? false : agent.retryable
   const activeElapsedMs = isDeep ? bestOfN.elapsedMs : agent.elapsedMs
+  // 深度分析（Best-of-N）跑的是3条并行的Agent Loop，"当前正在流式输出哪一句"
+  // 这个概念在单一候选场景下才有意义——这里先不给深度分析接token级流式展示
+  // 和用量统计，留空比强行拼一个语义不清楚的聚合值更诚实
+  const activeLiveReasoning = isDeep ? undefined : agent.liveReasoning
+  const activeUsageTotals = isDeep ? undefined : agent.usageTotals
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-indigo-50 via-gray-50 to-gray-50 text-gray-900">
@@ -204,8 +213,14 @@ function App() {
                 log={activeLog}
                 result={activeResult}
                 streamError={activeStreamError}
+                retryable={activeRetryable}
+                cancelled={activeCancelled}
+                onCancel={activeOnCancel}
+                onRetry={agent.retry}
                 done={activeDone}
                 elapsedMs={activeElapsedMs}
+                liveReasoning={activeLiveReasoning}
+                usageTotals={activeUsageTotals}
               />
               <ReportPanel result={activeResult} />
             </div>

@@ -14,11 +14,16 @@ class MetricPoint(BaseModel):
 
 
 class FinancialMetric(BaseModel):
-    tag: str  # XBRL us-gaap 标签名，如 "Revenues"
+    tag: str  # XBRL us-gaap 标签名，如 "Revenues"（年度数据用的标签；没有年度数据时是季度的）
+    # 年度和季度分别选标签（见sec_edgar._select_series），季度用了不同标签时记在这里
+    quarterly_tag: str | None = None
     label: str
     unit: str  # "USD" / "USD/shares" 等
     latest_annual: MetricPoint | None = None
     latest_quarterly: MetricPoint | None = None
+    # 数据质量说明：比如"单季度数据停留在2014-09-30，判定为过时"——这一期为None
+    # 时告诉Agent为什么没有，而不是让它以为数据正常缺席
+    notes: list[str] = []
 
 
 class FinancialsResponse(BaseModel):
